@@ -109,10 +109,22 @@ class TextChunker:
         text = text.strip()
         
         # Normalize quotes
-        text = text.replace('"', '"').replace('"', '"')
-        text = text.replace(''', "'").replace(''', "'")
+        text = text.replace('“', '"').replace('”', '"')
+        text = text.replace('‘', "'").replace('’', "'")
         
         return text
+
+    def _compose_document_text(self, document: Dict[str, Any]) -> str:
+        """Merge text, OCR, and image caption content into a single searchable string."""
+        parts = []
+
+        for key in ('text', 'ocr_text', 'caption'):
+            value = document.get(key)
+            if value and str(value).strip():
+                label = key.replace('_', ' ').title()
+                parts.append(f"{label}: {value.strip()}")
+
+        return "\n\n".join(parts).strip()
     
     def chunk_documents(self, documents: List[Dict[str, str]]) -> List[Dict[str, Any]]:
         """
@@ -127,11 +139,22 @@ class TextChunker:
         all_chunks = []
         
         for doc in documents:
-            text = doc.get('text', '')
             source = doc.get('source', 'unknown')
-            base_chunk_id = doc.get('chunk_id', 'doc')
-            
-            chunks = self.chunk_text(text, source, base_chunk_id)
+            base_chunk_id = doc.get('chunk_id', doc.get('document_id', 'doc'))
+            normalized_text = self._compose_document_text(doc)
+
+            chunks = self.chunk_text(normalized_text, source, base_chunk_id)
+            for chunk in chunks:
+                chunk['document_id'] = doc.get('document_id', base_chunk_id)
+                chunk['page_number'] = doc.get('page_number')
+                chunk['item_type'] = doc.get('item_type', 'text')
+                chunk['image_path'] = doc.get('image_path')
+                chunk['caption'] = doc.get('caption')
+                chunk['ocr_text'] = doc.get('ocr_text')
+                chunk['width'] = doc.get('width')
+                chunk['height'] = doc.get('height')
+                chunk['metadata'] = doc.get('metadata', {})
+
             all_chunks.extend(chunks)
         
         logger.info(f"Processed {len(documents)} documents into {len(all_chunks)} total chunks")

@@ -123,8 +123,17 @@ class Database:
             for chunk in chunks:
                 chunk_data.append({
                     'chunk_id': chunk['chunk_id'],
+                    'document_id': chunk.get('document_id', chunk['chunk_id'].split('#')[0]),
                     'source': chunk['source'],
+                    'page_number': chunk.get('page_number'),
+                    'item_type': chunk.get('item_type', 'text'),
                     'text': chunk['text'],
+                    'image_path': chunk.get('image_path'),
+                    'caption': chunk.get('caption'),
+                    'ocr_text': chunk.get('ocr_text'),
+                    'width': chunk.get('width'),
+                    'height': chunk.get('height'),
+                    'metadata': chunk.get('metadata', {}),
                     'embedding': chunk['embedding']  # Supabase handles vector serialization
                 })
             
