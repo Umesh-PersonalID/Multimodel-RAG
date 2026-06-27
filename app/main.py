@@ -8,7 +8,8 @@ Provides endpoints for document seeding and question answering with citations.
 
 import logging
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException
+from typing import List
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, Response
@@ -17,7 +18,9 @@ from .core.config import get_settings
 from .core.database import db
 from .models.requests import SeedRequest, AnswerRequest
 from .models.responses import SeedResponse, AnswerResponse, HealthResponse, ErrorResponse
+from .models.multimodal import UploadResponse
 from .services.rag import rag_service
+from .services.multimodal import multimodal_ingestion_service
 from .data.default_documents import DEFAULT_DOCUMENTS
 
 # Configure logging
@@ -105,6 +108,7 @@ async def root():
             "health": "/healthz",
             "seed": "/seed",
             "answer": "/answer",
+            "upload": "/upload",
             "documents": "/documents",
             "greet": "/greet/{name}"
         }
@@ -154,6 +158,21 @@ async def get_documents():
         List of default documents with their chunk_id, source, and text
     """
     return {"documents": DEFAULT_DOCUMENTS}
+
+
+@app.post("/upload", response_model=UploadResponse, tags=["RAG"])
+async def upload_documents(file: UploadFile = File(...)):
+    """Upload PDFs, images, or DOCX files and ingest them into the multimodal index."""
+
+    try:
+        upload_result = await multimodal_ingestion_service.ingest_upload(file)
+        return UploadResponse(**upload_result)
+    except Exception as e:
+        logger.error(f"Upload failed: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to process upload: {str(e)}"
+        )
 
 
 @app.post("/seed", response_model=SeedResponse, tags=["RAG"])
@@ -221,7 +240,9 @@ async def answer_question(request: AnswerRequest):
             debug={
                 'top_doc_ids': result['debug']['top_doc_ids'],
                 'latency_ms': result['debug']['latency_ms']
-            }
+            },
+            sources=result.get('sources', []),
+            images=result.get('images', [])
         )
         
         logger.info(f"Query processed successfully in {result['debug']['latency_ms']}ms")

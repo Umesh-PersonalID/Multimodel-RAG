@@ -293,6 +293,246 @@
             margin: 0;
         }
 
+        .upload-panel {
+            margin: 16px 20px 0;
+            padding: 16px;
+            border: 1px dashed var(--border-color);
+            border-radius: 16px;
+            background: linear-gradient(135deg, #ffffff 0%, #f8fafc 100%);
+        }
+
+        .upload-panel h3 {
+            font-size: 15px;
+            color: var(--text-primary);
+            margin-bottom: 6px;
+        }
+
+        .upload-panel p {
+            font-size: 13px;
+            color: var(--text-secondary);
+            margin-bottom: 12px;
+        }
+
+        .upload-zone {
+            border: 1px dashed var(--border-color);
+            border-radius: 14px;
+            padding: 16px;
+            background: rgba(255, 255, 255, 0.7);
+            transition: all 0.2s ease;
+            cursor: pointer;
+        }
+
+        .upload-zone.dragover {
+            border-color: var(--primary-color);
+            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.08);
+            transform: translateY(-1px);
+        }
+
+        .upload-zone-header {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .upload-icon {
+            width: 42px;
+            height: 42px;
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: linear-gradient(135deg, #eff6ff, #e0f2fe);
+            color: var(--primary-color);
+            font-size: 18px;
+            flex: none;
+        }
+
+        .upload-copy strong {
+            display: block;
+            font-size: 14px;
+            color: var(--text-primary);
+            margin-bottom: 2px;
+        }
+
+        .upload-copy span {
+            display: block;
+            font-size: 12px;
+            color: var(--text-secondary);
+            line-height: 1.5;
+        }
+
+        .upload-actions {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            margin-top: 14px;
+        }
+
+        .upload-button,
+        .upload-secondary {
+            padding: 10px 14px;
+            border-radius: 10px;
+            border: none;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 600;
+            transition: all 0.2s ease;
+        }
+
+        .upload-button {
+            background: var(--primary-color);
+            color: white;
+        }
+
+        .upload-button:hover {
+            background: var(--primary-dark);
+        }
+
+        .upload-secondary {
+            background: #eef2ff;
+            color: var(--primary-dark);
+            border: 1px solid rgba(99, 102, 241, 0.16);
+        }
+
+        .upload-button:disabled,
+        .upload-secondary:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+
+        .upload-summary {
+            margin-top: 12px;
+            font-size: 13px;
+            color: var(--text-secondary);
+            line-height: 1.5;
+        }
+
+        .upload-summary strong {
+            color: var(--text-primary);
+        }
+
+        .upload-summary.error {
+            color: #dc2626;
+        }
+
+        .upload-summary.success {
+            color: #059669;
+        }
+
+        .upload-progress {
+            display: none;
+            margin-top: 14px;
+            padding: 14px;
+            border-radius: 12px;
+            background: rgba(239, 246, 255, 0.8);
+            border: 1px solid #bfdbfe;
+        }
+
+        .upload-progress.active {
+            display: block;
+        }
+
+        .upload-step {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-size: 13px;
+            color: var(--text-secondary);
+            padding: 6px 0;
+        }
+
+        .upload-step.active {
+            color: var(--primary-color);
+            font-weight: 600;
+        }
+
+        .upload-step.done {
+            color: #059669;
+        }
+
+        .upload-step-icon {
+            width: 22px;
+            height: 22px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 11px;
+            background: var(--border-color);
+            flex: none;
+        }
+
+        .upload-step.active .upload-step-icon {
+            background: var(--primary-color);
+            color: white;
+        }
+
+        .upload-step.done .upload-step-icon {
+            background: #10b981;
+            color: white;
+        }
+
+        .upload-result {
+            display: none;
+            margin-top: 14px;
+            padding: 14px;
+            border-radius: 12px;
+            background: #f0fdf4;
+            border: 1px solid #bbf7d0;
+        }
+
+        .upload-result.show {
+            display: block;
+        }
+
+        .upload-result h4 {
+            font-size: 14px;
+            color: #166534;
+            margin-bottom: 10px;
+        }
+
+        .upload-result-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+            font-size: 12px;
+            color: var(--text-secondary);
+        }
+
+        .upload-result-grid span {
+            color: var(--text-primary);
+            font-weight: 600;
+        }
+
+        .upload-history {
+            margin-top: 20px;
+        }
+
+        .upload-history h4 {
+            font-size: 14px;
+            color: var(--text-primary);
+            margin-bottom: 10px;
+        }
+
+        .upload-history-item {
+            padding: 10px 12px;
+            border-radius: 10px;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            margin-bottom: 8px;
+            font-size: 12px;
+            color: var(--text-secondary);
+        }
+
+        .upload-history-item strong {
+            color: var(--text-primary);
+            font-size: 13px;
+        }
+
+        #fileInput {
+            display: none;
+        }
+
         .editor-tabs {
             display: flex;
             background: var(--bg-secondary);
@@ -455,9 +695,9 @@
             transform: translateX(0);
         }
 
-        .notification.success { background: var(--success-color); }
-        .notification.error { background: var(--error-color); }
-        .notification.info { background: var(--info-color); }
+        .notification.success { background: #10b981; }
+        .notification.error { background: #ef4444; }
+        .notification.info { background: #6366f1; }
 
         @keyframes fadeInUp {
             from {
@@ -534,7 +774,7 @@
                         • Return and shipping information
                         • Customer support inquiries
                         <br><br>
-                        You can also edit the knowledge base documents on the right panel and update the vector database in real-time!
+                        You can also edit the knowledge base documents on the right panel, upload PDFs/images via the Upload tab, and update the vector database in real-time!
                     </div>
                 </div>
             </div>
@@ -562,18 +802,80 @@
             <div class="editor-header">
                 <div>
                     <h2>📋 Knowledge Base Editor</h2>
-                    <p>Edit documents and update the vector database</p>
+                    <p>Edit documents, upload files, and update the vector database</p>
                 </div>
             </div>
 
+
+
             <div class="editor-tabs">
                 <button class="tab-button active" onclick="switchTab('documents')">Documents</button>
+                <button class="tab-button" onclick="switchTab('upload')">Upload</button>
                 <button class="tab-button" onclick="switchTab('settings')">Settings</button>
             </div>
 
             <div class="tab-content" id="documentsTab">
                 <div id="documentsContainer">
                     <!-- Documents will be loaded here -->
+                </div>
+            </div>
+
+            <div class="tab-content" id="uploadTab" style="display: none;">
+                <div class="upload-panel" style="margin: 0; padding: 0; border: none; background: transparent;">
+                    <h3>Upload to Knowledge Base</h3>
+                    <p>Upload a PDF, DOCX, image, or text file. It will be split into chunks, embedded, and stored in Supabase automatically.</p>
+
+                    <div class="upload-zone" id="uploadZone">
+                        <div class="upload-zone-header">
+                            <div class="upload-icon">📄</div>
+                            <div class="upload-copy">
+                                <strong>Drag & drop a file here</strong>
+                                <span>PDF, DOCX, PNG, JPG, WEBP, GIF, TXT — max recommended 20 MB</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <input type="file" id="fileInput" accept=".pdf,.docx,.png,.jpg,.jpeg,.webp,.gif,.bmp,.tiff,.txt,.md,.csv">
+
+                    <div class="upload-actions">
+                        <button type="button" class="upload-button" id="uploadBtn">Choose File</button>
+                        <button type="button" class="upload-secondary" id="uploadSubmitBtn" disabled>Upload &amp; Index</button>
+                    </div>
+
+                    <div class="upload-summary" id="uploadSummary">No file selected</div>
+
+                    <div class="upload-progress" id="uploadProgress">
+                        <div class="upload-step" id="stepUpload">
+                            <div class="upload-step-icon">1</div>
+                            <span>Uploading file to server</span>
+                        </div>
+                        <div class="upload-step" id="stepExtract">
+                            <div class="upload-step-icon">2</div>
+                            <span>Extracting text &amp; images</span>
+                        </div>
+                        <div class="upload-step" id="stepChunk">
+                            <div class="upload-step-icon">3</div>
+                            <span>Splitting into chunks</span>
+                        </div>
+                        <div class="upload-step" id="stepEmbed">
+                            <div class="upload-step-icon">4</div>
+                            <span>Generating embeddings</span>
+                        </div>
+                        <div class="upload-step" id="stepStore">
+                            <div class="upload-step-icon">5</div>
+                            <span>Storing in Supabase</span>
+                        </div>
+                    </div>
+
+                    <div class="upload-result" id="uploadResult">
+                        <h4>✅ Indexed successfully</h4>
+                        <div class="upload-result-grid" id="uploadResultGrid"></div>
+                    </div>
+
+                    <div class="upload-history" id="uploadHistorySection" style="display: none;">
+                        <h4>Recent uploads</h4>
+                        <div id="uploadHistoryList"></div>
+                    </div>
                 </div>
             </div>
 
@@ -614,9 +916,24 @@
         const documentsContainer = document.getElementById('documentsContainer');
         const saveBtn = document.getElementById('saveBtn');
         const notification = document.getElementById('notification');
+        const fileInput = document.getElementById('fileInput');
+        const uploadZone = document.getElementById('uploadZone');
+        const uploadBtn = document.getElementById('uploadBtn');
+        const uploadSubmitBtn = document.getElementById('uploadSubmitBtn');
+        const uploadSummary = document.getElementById('uploadSummary');
+        const uploadProgress = document.getElementById('uploadProgress');
+        const uploadResult = document.getElementById('uploadResult');
+        const uploadResultGrid = document.getElementById('uploadResultGrid');
+        const uploadHistorySection = document.getElementById('uploadHistorySection');
+        const uploadHistoryList = document.getElementById('uploadHistoryList');
+
+        const ACCEPTED_EXTENSIONS = ['.pdf', '.docx', '.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.tiff', '.txt', '.md', '.csv'];
+        const UPLOAD_STEPS = ['stepUpload', 'stepExtract', 'stepChunk', 'stepEmbed', 'stepStore'];
 
         let documents = [];
         let currentTab = 'documents';
+        let selectedUploadFile = null;
+        let uploadHistory = [];
 
         // Initialize the application
         init();
@@ -634,6 +951,43 @@
                 sendMessage();
             }
         });
+
+        uploadBtn.addEventListener('click', () => fileInput.click());
+
+        uploadZone.addEventListener('click', () => fileInput.click());
+
+        uploadZone.addEventListener('dragenter', function(e) {
+            e.preventDefault();
+            uploadZone.classList.add('dragover');
+        });
+
+        uploadZone.addEventListener('dragover', function(e) {
+            e.preventDefault();
+            uploadZone.classList.add('dragover');
+        });
+
+        uploadZone.addEventListener('dragleave', function(e) {
+            e.preventDefault();
+            uploadZone.classList.remove('dragover');
+        });
+
+        uploadZone.addEventListener('drop', function(e) {
+            e.preventDefault();
+            uploadZone.classList.remove('dragover');
+            const droppedFile = e.dataTransfer.files[0];
+            if (droppedFile) {
+                handleUploadSelection(droppedFile);
+            }
+        });
+
+        fileInput.addEventListener('change', function() {
+            const file = fileInput.files[0];
+            if (file) {
+                handleUploadSelection(file);
+            }
+        });
+
+        uploadSubmitBtn.addEventListener('click', uploadDocument);
 
         async function checkHealth() {
             try {
@@ -707,6 +1061,103 @@
             documents[index].text = text;
         }
 
+        function isAcceptedFile(file) {
+            const name = file.name.toLowerCase();
+            return ACCEPTED_EXTENSIONS.some(ext => name.endsWith(ext)) || file.type.startsWith('image/') || file.type === 'application/pdf';
+        }
+
+        function handleUploadSelection(file) {
+            if (!isAcceptedFile(file)) {
+                showNotification('Unsupported file type. Use PDF, DOCX, image, or text files.', 'error');
+                fileInput.value = '';
+                return;
+            }
+
+            selectedUploadFile = file;
+            uploadResult.classList.remove('show');
+            uploadSummary.className = 'upload-summary';
+            uploadSummary.innerHTML = `<strong>${escapeHtml(file.name)}</strong> selected · ${formatFileSize(file.size)} · ${file.type || 'unknown type'}`;
+            uploadSubmitBtn.disabled = false;
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function resetUploadSteps() {
+            UPLOAD_STEPS.forEach(id => {
+                const el = document.getElementById(id);
+                el.classList.remove('active', 'done');
+            });
+        }
+
+        function setUploadStep(stepId) {
+            let reached = false;
+            for (const id of UPLOAD_STEPS) {
+                const el = document.getElementById(id);
+                el.classList.remove('active');
+                if (id === stepId) {
+                    el.classList.add('active');
+                    reached = true;
+                } else if (!reached) {
+                    el.classList.add('done');
+                } else {
+                    el.classList.remove('done');
+                }
+            }
+        }
+
+        function markAllUploadStepsDone() {
+            UPLOAD_STEPS.forEach(id => {
+                const el = document.getElementById(id);
+                el.classList.remove('active');
+                el.classList.add('done');
+            });
+        }
+
+        function addUploadHistoryEntry(data) {
+            uploadHistory.unshift({
+                filename: data.filename,
+                file_type: data.file_type,
+                chunks_inserted: data.chunks_inserted,
+                pages_processed: data.pages_processed,
+                images_extracted: data.images_extracted,
+                document_id: data.document_id,
+                timestamp: new Date()
+            });
+            uploadHistory = uploadHistory.slice(0, 5);
+            renderUploadHistory();
+        }
+
+        function renderUploadHistory() {
+            if (uploadHistory.length === 0) {
+                uploadHistorySection.style.display = 'none';
+                return;
+            }
+
+            uploadHistorySection.style.display = 'block';
+            uploadHistoryList.innerHTML = uploadHistory.map(entry => `
+                <div class="upload-history-item">
+                    <strong>${escapeHtml(entry.filename)}</strong><br>
+                    ${entry.chunks_inserted} chunks · ${entry.pages_processed} pages · ${entry.images_extracted} images · ${entry.file_type}
+                </div>
+            `).join('');
+        }
+
+        function formatFileSize(bytes) {
+            if (!bytes && bytes !== 0) return 'Unknown size';
+            const units = ['B', 'KB', 'MB', 'GB'];
+            let size = bytes;
+            let unitIndex = 0;
+            while (size >= 1024 && unitIndex < units.length - 1) {
+                size /= 1024;
+                unitIndex += 1;
+            }
+            return `${size.toFixed(size < 10 ? 1 : 0)} ${units[unitIndex]}`;
+        }
+
         function switchTab(tabName) {
             currentTab = tabName;
             
@@ -718,6 +1169,7 @@
             
             // Show/hide tab content
             document.getElementById('documentsTab').style.display = tabName === 'documents' ? 'block' : 'none';
+            document.getElementById('uploadTab').style.display = tabName === 'upload' ? 'block' : 'none';
             document.getElementById('settingsTab').style.display = tabName === 'settings' ? 'block' : 'none';
         }
 
@@ -779,6 +1231,85 @@
             setTimeout(() => {
                 notification.classList.remove('show');
             }, 4000);
+        }
+
+        async function uploadDocument() {
+            if (!selectedUploadFile) {
+                showNotification('Please choose a PDF, image, or DOCX file first.', 'info');
+                return;
+            }
+
+            uploadSubmitBtn.disabled = true;
+            uploadBtn.disabled = true;
+            uploadSubmitBtn.textContent = 'Processing...';
+            uploadResult.classList.remove('show');
+            uploadSummary.className = 'upload-summary';
+            uploadSummary.innerHTML = `Processing <strong>${escapeHtml(selectedUploadFile.name)}</strong>...`;
+            uploadProgress.classList.add('active');
+            resetUploadSteps();
+            setUploadStep('stepUpload');
+
+            const progressTimers = [
+                setTimeout(() => setUploadStep('stepExtract'), 400),
+                setTimeout(() => setUploadStep('stepChunk'), 1200),
+                setTimeout(() => setUploadStep('stepEmbed'), 2200),
+                setTimeout(() => setUploadStep('stepStore'), 3500),
+            ];
+
+            try {
+                const formData = new FormData();
+                formData.append('file', selectedUploadFile);
+
+                const response = await fetch(`${API_BASE_URL}/upload`, {
+                    method: 'POST',
+                    body: formData
+                });
+
+                progressTimers.forEach(clearTimeout);
+                markAllUploadStepsDone();
+
+                if (!response.ok) {
+                    let detail = 'Upload failed';
+                    try {
+                        const err = await response.json();
+                        detail = err.detail || err.error || detail;
+                    } catch (_) { /* ignore */ }
+                    throw new Error(detail);
+                }
+
+                const data = await response.json();
+
+                uploadSummary.className = 'upload-summary success';
+                uploadSummary.innerHTML = `<strong>${escapeHtml(data.filename)}</strong> indexed · ${data.chunks_inserted} chunks stored in Supabase`;
+
+                uploadResultGrid.innerHTML = `
+                    <div>Document ID<br><span>${escapeHtml(data.document_id)}</span></div>
+                    <div>File type<br><span>${escapeHtml(data.file_type)}</span></div>
+                    <div>Chunks inserted<br><span>${data.chunks_inserted}</span></div>
+                    <div>Pages processed<br><span>${data.pages_processed}</span></div>
+                    <div>Images extracted<br><span>${data.images_extracted}</span></div>
+                    <div>OCR applied<br><span>${data.ocr_applied ? 'Yes' : 'No'}</span></div>
+                `;
+                uploadResult.classList.add('show');
+
+                addUploadHistoryEntry(data);
+                showNotification(`Uploaded ${data.filename}: ${data.chunks_inserted} chunks indexed.`, 'success');
+
+                fileInput.value = '';
+                selectedUploadFile = null;
+                uploadSubmitBtn.disabled = true;
+            } catch (error) {
+                progressTimers.forEach(clearTimeout);
+                uploadProgress.classList.remove('active');
+                resetUploadSteps();
+                uploadSummary.className = 'upload-summary error';
+                uploadSummary.textContent = error.message || 'Upload failed. Please try again.';
+                showNotification(`Upload failed: ${error.message}`, 'error');
+            } finally {
+                uploadBtn.disabled = false;
+                uploadSubmitBtn.textContent = 'Upload & Index';
+                setTimeout(() => uploadProgress.classList.remove('active'), 1500);
+            }
         }
 
         function addMessage(content, isUser = false, citations = []) {

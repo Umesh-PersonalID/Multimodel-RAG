@@ -8,6 +8,8 @@ Response models for the RAG API endpoints.
 from typing import List, Dict, Any
 from pydantic import BaseModel, Field
 
+from .multimodal import SourceReference, ImageReference
+
 
 class SeedResponse(BaseModel):
     """Response model for the /seed endpoint."""
@@ -25,6 +27,8 @@ class AnswerResponse(BaseModel):
     text: str = Field(..., description="Generated answer with inline citations")
     citations: List[str] = Field(..., description="List of chunk IDs used as sources")
     debug: DebugInfo = Field(..., description="Debug information")
+    sources: List[SourceReference] = Field(default_factory=list, description="Retrieved source references")
+    images: List[ImageReference] = Field(default_factory=list, description="Retrieved image references")
 
 
 class HealthResponse(BaseModel):

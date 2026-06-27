@@ -118,7 +118,29 @@ class RAGService:
                 'debug': {
                     'top_doc_ids': [block['chunk_id'] for block in context_blocks],
                     'latency_ms': elapsed_ms
-                }
+                },
+                'sources': [
+                    {
+                        'chunk_id': block.get('chunk_id'),
+                        'document_id': block.get('document_id', block.get('chunk_id', '').split('#')[0]),
+                        'source': block.get('source', 'unknown'),
+                        'item_type': block.get('item_type', 'text'),
+                        'page_number': block.get('page_number'),
+                        'image_path': block.get('image_path'),
+                        'caption': block.get('caption') or block.get('ocr_text'),
+                    }
+                    for block in context_blocks
+                ],
+                'images': [
+                    {
+                        'chunk_id': block.get('chunk_id'),
+                        'image_path': block.get('image_path'),
+                        'page_number': block.get('page_number'),
+                        'caption': block.get('caption') or block.get('ocr_text'),
+                    }
+                    for block in context_blocks
+                    if block.get('image_path')
+                ]
             }
             
             logger.info(f"Query processed in {elapsed_ms}ms with {len(citations)} citations")
@@ -145,22 +167,19 @@ class RAGService:
         Returns:
             Processed context blocks
         """
-        # Simple deduplication by chunk_id prefix (MMR-lite)
-        seen_prefixes = set()
+        # Simple deduplication by exact chunk_id so multimodal chunks stay visible.
+        seen_chunk_ids = set()
         context_blocks = []
         
         for result in search_results:
             chunk_id = result.get('chunk_id', '')
-            
-            # Extract base chunk ID (before #)
-            base_id = chunk_id.split('#')[0] if '#' in chunk_id else chunk_id
-            
-            if base_id not in seen_prefixes:
+
+            if chunk_id not in seen_chunk_ids:
                 context_blocks.append(result)
-                seen_prefixes.add(base_id)
+                seen_chunk_ids.add(chunk_id)
             
             # Limit to reasonable context size
-            if len(context_blocks) >= 4:
+            if len(context_blocks) >= 6:
                 break
         
         logger.info(f"Prepared {len(context_blocks)} unique context blocks")

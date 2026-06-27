@@ -42,6 +42,20 @@ class Settings(BaseSettings):
     chunk_overlap: int = Field(default=60)  # 15% overlap
     temperature: float = Field(default=0.1)
     embedding_dimensions: int = Field(default=1536)  # text-embedding-3-small dimensions
+
+    # Multimodal storage
+    storage_root: str = Field(default="storage", env="STORAGE_ROOT")
+    uploaded_docs_dir: str = Field(default="storage/uploaded_docs", env="UPLOADED_DOCS_DIR")
+    extracted_images_dir: str = Field(default="storage/extracted_images", env="EXTRACTED_IMAGES_DIR")
+
+    # Upload ingestion limits (prevents runaway OpenAI calls on image-heavy PDFs)
+    upload_vision_caption_enabled: bool = Field(default=False, env="UPLOAD_VISION_CAPTION_ENABLED")
+    upload_max_vision_captions: int = Field(default=5, env="UPLOAD_MAX_VISION_CAPTIONS")
+    upload_max_images_per_document: int = Field(default=10, env="UPLOAD_MAX_IMAGES_PER_DOCUMENT")
+    upload_min_image_dimension: int = Field(default=120, env="UPLOAD_MIN_IMAGE_DIMENSION")
+    upload_skip_embedded_images_when_page_has_text: bool = Field(
+        default=True, env="UPLOAD_SKIP_EMBEDDED_IMAGES_WHEN_PAGE_HAS_TEXT"
+    )
     
     class Config:
         """Pydantic configuration."""
