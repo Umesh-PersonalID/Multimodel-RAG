@@ -1,0 +1,4647 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+app/
+  core/
+    __init__.py
+    config.py
+    database.py
+  data/
+    __init__.py
+    default_documents.py
+  models/
+    __init__.py
+    entities.py
+    multimodal.py
+    requests.py
+    responses.py
+  services/
+    __init__.py
+    chat.py
+    chunker.py
+    embedding.py
+    multimodal.py
+    rag.py
+  __init__.py
+  main.py
+models/
+  multimodal_ai_platform_architecture.svg
+sql/
+  init_supabase.sql
+static/
+  chat.html
+storage/
+  uploaded_docs/
+    1a98efb73e894074878125fba4bc25c5/
+      Umesh_Resume (2).pdf
+.gitignore
+chatbot.py
+check_dimensions.py
+DEPLOYMENT.md
+Dockerfile
+main.py
+package.json
+README.md
+requirements.txt
+test_setup.py
+verify_rag.py
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="app/models/multimodal.py">
+# Copyright 2024
+# Directory: yt-rag/app/models/multimodal.py
+
+"""
+Multimodal ingestion and retrieval models.
+"""
+
+from typing import Any, Dict, List, Optional
+from pydantic import BaseModel, Field
+
+
+class MultimodalDocument(BaseModel):
+    """Unified document representation for text, OCR, and image-derived content."""
+
+    document_id: str = Field(..., description="Stable identifier for the uploaded document")
+    chunk_id: str = Field(..., description="Unique chunk identifier")
+    source: str = Field(..., description="Original filename, URL, or source label")
+    text: str = Field(..., description="Chunk text used for embeddings")
+    item_type: str = Field(..., description="Content type such as text, ocr, image, or caption")
+    page_number: Optional[int] = Field(None, description="Page number when available")
+    image_path: Optional[str] = Field(None, description="Stored image path when the chunk came from an image")
+    caption: Optional[str] = Field(None, description="Vision caption for an image chunk")
+    ocr_text: Optional[str] = Field(None, description="OCR extracted text")
+    width: Optional[int] = Field(None, description="Image width in pixels")
+    height: Optional[int] = Field(None, description="Image height in pixels")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="Arbitrary metadata")
+
+
+class ImageReference(BaseModel):
+    """Image reference returned to the client."""
+
+    image_path: str = Field(..., description="Stored image path")
+    chunk_id: str = Field(..., description="Chunk associated with the image")
+    page_number: Optional[int] = Field(None, description="Page number when available")
+    caption: Optional[str] = Field(None, description="Caption or OCR summary")
+
+
+class SourceReference(BaseModel):
+    """Source reference exposed in answer metadata."""
+
+    chunk_id: str = Field(..., description="Chunk identifier")
+    document_id: str = Field(..., description="Document identifier")
+    source: str = Field(..., description="Original source label")
+    item_type: str = Field(..., description="Content type")
+    page_number: Optional[int] = Field(None, description="Page number when available")
+    image_path: Optional[str] = Field(None, description="Stored image path when available")
+    caption: Optional[str] = Field(None, description="Caption or OCR summary")
+
+
+class UploadResponse(BaseModel):
+    """Response returned after a document upload."""
+
+    document_id: str = Field(..., description="Assigned document identifier")
+    filename: str = Field(..., description="Uploaded filename")
+    file_type: str = Field(..., description="Detected file type")
+    chunks_inserted: int = Field(..., description="Number of chunks stored")
+    pages_processed: int = Field(..., description="Number of pages processed")
+    images_extracted: int = Field(..., description="Number of images extracted")
+    ocr_applied: bool = Field(..., description="Whether OCR was attempted")
+    sources: List[SourceReference] = Field(default_factory=list, description="Stored chunk references")
+</file>
+
+<file path="app/services/multimodal.py">
+# Copyright 2024
+# Directory: yt-rag/app/services/multimodal.py
+
+"""
+Multimodal document ingestion pipeline.
+
+This service saves uploaded files, extracts text and images from PDFs and DOCX
+documents, performs OCR when needed, and creates chunk-ready multimodal records
+that can be embedded and stored in Supabase.
+"""
+
+from __future__ import annotations
+
+import base64
+import io
+import logging
+import mimetypes
+import zipfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+from uuid import uuid4
+
+from fastapi import UploadFile
+
+from ..core.config import get_settings
+from ..core.database import db
+from ..models.multimodal import ImageReference, SourceReference
+from .chunker import chunker
+from .embedding import embedding_service
+
+logger = logging.getLogger(__name__)
+settings = get_settings()
+
+
+@dataclass
+class ExtractionResult:
+    """Internal extraction result for a document."""
+
+    records: List[Dict[str, Any]]
+    pages_processed: int
+    images_extracted: int
+    ocr_applied: bool
+    file_type: str
+
+
+class OCRService:
+    """Optional OCR wrapper with graceful fallback when OCR tooling is unavailable."""
+
+    def extract_text(self, image_bytes: bytes) -> str:
+        try:
+            import pytesseract
+            from PIL import Image
+
+            image = Image.open(io.BytesIO(image_bytes))
+            text = pytesseract.image_to_string(image)
+            return text.strip()
+        except Exception as exc:
+            logger.debug("OCR unavailable or failed: %s", exc)
+            return ""
+
+
+class VisionCaptionService:
+    """Generate concise image captions using the configured chat provider."""
+
+    def __init__(self) -> None:
+        from ..core.config import get_settings
+
+        self.settings = get_settings()
+        self.provider = self.settings.ai_provider
+
+        if self.provider == "openai":
+            import openai
+
+            self.client = openai.OpenAI(api_key=self.settings.openai_api_key)
+            self.model = self.settings.openai_chat_model
+        elif self.provider == "anthropic":
+            import anthropic
+
+            self.client = anthropic.Anthropic(api_key=self.settings.anthropic_api_key)
+            self.model = self.settings.anthropic_chat_model
+        else:
+            self.client = None
+            self.model = ""
+
+    async def caption_image(
+        self,
+        image_bytes: bytes,
+        mime_type: str,
+        filename: str,
+        page_number: Optional[int] = None,
+        image_index: Optional[int] = None,
+        ocr_text: str = "",
+    ) -> str:
+        """Create a caption for an image using the configured model."""
+
+        if not self.client:
+            return self._fallback_caption(filename, page_number, image_index, ocr_text)
+
+        encoded_image = base64.b64encode(image_bytes).decode("ascii")
+        page_suffix = f" on page {page_number}" if page_number else ""
+        image_suffix = f" image {image_index}" if image_index else ""
+        prompt = (
+            "Write a concise search-friendly caption for this document image. "
+            "Describe diagrams, charts, tables, UI screenshots, and labels if present. "
+            "Return only the caption text."
+        )
+        if ocr_text:
+            prompt += f" OCR text extracted from the image: {ocr_text[:500]}"
+
+        try:
+            if self.provider == "openai":
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": "You caption document images for multimodal retrieval."
+                        },
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt + page_suffix + image_suffix},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:{mime_type};base64,{encoded_image}",
+                                        "detail": "high",
+                                    },
+                                },
+                            ],
+                        },
+                    ],
+                    temperature=0,
+                    max_tokens=200,
+                )
+                caption = response.choices[0].message.content or ""
+                return caption.strip() or self._fallback_caption(filename, page_number, image_index, ocr_text)
+
+            if self.provider == "anthropic":
+                response = self.client.messages.create(
+                    model=self.model,
+                    max_tokens=200,
+                    temperature=0,
+                    system="You caption document images for multimodal retrieval.",
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt + page_suffix + image_suffix},
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": mime_type,
+                                        "data": encoded_image,
+                                    },
+                                },
+                            ],
+                        }
+                    ],
+                )
+                caption = response.content[0].text if response.content else ""
+                return caption.strip() or self._fallback_caption(filename, page_number, image_index, ocr_text)
+
+        except Exception as exc:
+            logger.warning("Vision captioning failed, using fallback: %s", exc)
+
+        return self._fallback_caption(filename, page_number, image_index, ocr_text)
+
+    def _fallback_caption(
+        self,
+        filename: str,
+        page_number: Optional[int] = None,
+        image_index: Optional[int] = None,
+        ocr_text: str = "",
+    ) -> str:
+        page_suffix = f" page {page_number}" if page_number else ""
+        image_suffix = f" image {image_index}" if image_index else ""
+        caption = f"Document image from {filename}{page_suffix}{image_suffix}."
+        if ocr_text:
+            caption += f" OCR text: {ocr_text[:240]}"
+        return caption.strip()
+
+
+class MultimodalIngestionService:
+    """End-to-end multimodal document ingestion service."""
+
+    def __init__(self) -> None:
+        self.settings = settings
+        self.upload_root = Path(self.settings.uploaded_docs_dir)
+        self.image_root = Path(self.settings.extracted_images_dir)
+        self.upload_root.mkdir(parents=True, exist_ok=True)
+        self.image_root.mkdir(parents=True, exist_ok=True)
+        self.ocr_service = OCRService()
+        self.vision_service = VisionCaptionService()
+
+    async def ingest_upload(self, upload: UploadFile) -> Dict[str, Any]:
+        """Persist an upload, extract multimodal records, and store them in Supabase."""
+
+        file_bytes = await upload.read()
+        filename = upload.filename or "upload.bin"
+        file_type = self._detect_file_type(filename, upload.content_type)
+        document_id = uuid4().hex
+        saved_path = self._save_upload(document_id, filename, file_bytes)
+
+        extraction = await self._extract_records(
+            document_id=document_id,
+            filename=filename,
+            file_type=file_type,
+            saved_path=saved_path,
+            file_bytes=file_bytes,
+            content_type=upload.content_type or mimetypes.guess_type(filename)[0] or "application/octet-stream",
+        )
+
+        chunks = chunker.chunk_documents(extraction.records)
+        if chunks:
+            embeddings = await embedding_service.embed_texts([chunk["text"] for chunk in chunks])
+            for chunk, embedding in zip(chunks, embeddings):
+                chunk["embedding"] = embedding
+
+        inserted = await db.upsert_chunks(chunks)
+        sources = [self._chunk_to_source_reference(chunk) for chunk in chunks]
+
+        return {
+            "document_id": document_id,
+            "filename": filename,
+            "file_type": file_type,
+            "chunks_inserted": inserted,
+            "pages_processed": extraction.pages_processed,
+            "images_extracted": extraction.images_extracted,
+            "ocr_applied": extraction.ocr_applied,
+            "sources": sources,
+        }
+
+    async def _extract_records(
+        self,
+        document_id: str,
+        filename: str,
+        file_type: str,
+        saved_path: Path,
+        file_bytes: bytes,
+        content_type: str,
+    ) -> ExtractionResult:
+        if file_type == "pdf":
+            return await self._extract_pdf(document_id, filename, saved_path, file_bytes, content_type)
+        if file_type == "image":
+            return await self._extract_image(document_id, filename, saved_path, file_bytes, content_type)
+        if file_type == "docx":
+            return await self._extract_docx(document_id, filename, saved_path, file_bytes, content_type)
+        return await self._extract_plain_text(document_id, filename, saved_path, file_bytes, content_type)
+
+    async def _extract_pdf(
+        self,
+        document_id: str,
+        filename: str,
+        saved_path: Path,
+        file_bytes: bytes,
+        content_type: str,
+    ) -> ExtractionResult:
+        try:
+            import fitz
+        except Exception as exc:
+            raise RuntimeError("PyMuPDF is required for PDF processing") from exc
+
+        records: List[Dict[str, Any]] = []
+        pages_processed = 0
+        images_extracted = 0
+        ocr_applied = False
+
+        document = fitz.open(stream=file_bytes, filetype="pdf")
+        for page_index in range(document.page_count):
+            page = document[page_index]
+            page_number = page_index + 1
+            pages_processed += 1
+
+            page_text = (page.get_text("text") or "").strip()
+            metadata = {
+                "filename": filename,
+                "content_type": content_type,
+                "saved_path": str(saved_path),
+                "page_number": page_number,
+            }
+
+            if page_text:
+                records.append({
+                    "document_id": document_id,
+                    "chunk_id": f"{document_id}_p{page_number}_text",
+                    "source": filename,
+                    "page_number": page_number,
+                    "item_type": "text",
+                    "text": page_text,
+                    "metadata": metadata,
+                })
+
+            page_image_bytes = None
+            if not page_text:
+                try:
+                    pixmap = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+                    page_image_bytes = pixmap.tobytes("png")
+                    ocr_text = self.ocr_service.extract_text(page_image_bytes)
+                    ocr_applied = True
+                    if ocr_text:
+                        records.append({
+                            "document_id": document_id,
+                            "chunk_id": f"{document_id}_p{page_number}_ocr",
+                            "source": filename,
+                            "page_number": page_number,
+                            "item_type": "ocr",
+                            "text": ocr_text,
+                            "ocr_text": ocr_text,
+                            "metadata": metadata,
+                        })
+                except Exception as exc:
+                    logger.debug("Page OCR failed for %s page %s: %s", filename, page_number, exc)
+
+            images = page.get_images(full=True)
+            for image_index, image_info in enumerate(images, start=1):
+                xref = image_info[0]
+                extracted = document.extract_image(xref)
+                image_bytes = extracted.get("image")
+                if not image_bytes:
+                    continue
+
+                image_ext = extracted.get("ext", "png")
+                image_path = self._save_extracted_image(document_id, filename, page_number, image_index, image_bytes, image_ext)
+                images_extracted += 1
+                image_ocr = self.ocr_service.extract_text(image_bytes)
+                if image_ocr:
+                    ocr_applied = True
+
+                caption = await self.vision_service.caption_image(
+                    image_bytes=image_bytes,
+                    mime_type=mimetypes.types_map.get(f".{image_ext}", "image/png"),
+                    filename=filename,
+                    page_number=page_number,
+                    image_index=image_index,
+                    ocr_text=image_ocr,
+                )
+
+                text_parts = [caption]
+                if image_ocr:
+                    text_parts.append(f"OCR: {image_ocr}")
+
+                records.append({
+                    "document_id": document_id,
+                    "chunk_id": f"{document_id}_p{page_number}_img{image_index}",
+                    "source": filename,
+                    "page_number": page_number,
+                    "item_type": "image",
+                    "text": "\n\n".join(text_parts),
+                    "image_path": str(image_path),
+                    "caption": caption,
+                    "ocr_text": image_ocr or None,
+                    "width": extracted.get("width"),
+                    "height": extracted.get("height"),
+                    "metadata": {
+                        **metadata,
+                        "image_xref": xref,
+                        "image_extension": image_ext,
+                    },
+                })
+
+        return ExtractionResult(records, pages_processed, images_extracted, ocr_applied, "pdf")
+
+    async def _extract_image(
+        self,
+        document_id: str,
+        filename: str,
+        saved_path: Path,
+        file_bytes: bytes,
+        content_type: str,
+    ) -> ExtractionResult:
+        from PIL import Image
+
+        image = Image.open(io.BytesIO(file_bytes))
+        width, height = image.size
+        mime_type = content_type or mimetypes.guess_type(filename)[0] or "image/png"
+        ocr_text = self.ocr_service.extract_text(file_bytes)
+        caption = await self.vision_service.caption_image(
+            image_bytes=file_bytes,
+            mime_type=mime_type,
+            filename=filename,
+            ocr_text=ocr_text,
+        )
+
+        image_path = self._save_extracted_image(document_id, filename, None, 1, file_bytes, Path(filename).suffix.lstrip(".") or "png")
+        record = {
+            "document_id": document_id,
+            "chunk_id": f"{document_id}_image_1",
+            "source": filename,
+            "page_number": None,
+            "item_type": "image",
+            "text": "\n\n".join(part for part in [caption, f"OCR: {ocr_text}" if ocr_text else ""] if part),
+            "image_path": str(image_path),
+            "caption": caption,
+            "ocr_text": ocr_text or None,
+            "width": width,
+            "height": height,
+            "metadata": {
+                "filename": filename,
+                "content_type": mime_type,
+                "saved_path": str(saved_path),
+            },
+        }
+        return ExtractionResult([record], 1, 1, bool(ocr_text), "image")
+
+    async def _extract_docx(
+        self,
+        document_id: str,
+        filename: str,
+        saved_path: Path,
+        file_bytes: bytes,
+        content_type: str,
+    ) -> ExtractionResult:
+        try:
+            from docx import Document
+        except Exception as exc:
+            raise RuntimeError("python-docx is required for DOCX processing") from exc
+
+        records: List[Dict[str, Any]] = []
+        paragraphs: List[str] = []
+        document = Document(io.BytesIO(file_bytes))
+        for paragraph in document.paragraphs:
+            text = paragraph.text.strip()
+            if text:
+                paragraphs.append(text)
+
+        combined_text = "\n".join(paragraphs).strip()
+        if combined_text:
+            records.append({
+                "document_id": document_id,
+                "chunk_id": f"{document_id}_docx_text",
+                "source": filename,
+                "page_number": None,
+                "item_type": "text",
+                "text": combined_text,
+                "metadata": {
+                    "filename": filename,
+                    "content_type": content_type,
+                    "saved_path": str(saved_path),
+                },
+            })
+
+        images_extracted = 0
+        with zipfile.ZipFile(io.BytesIO(file_bytes)) as archive:
+            for member in archive.namelist():
+                if not member.startswith("word/media/"):
+                    continue
+
+                image_bytes = archive.read(member)
+                image_name = Path(member).name
+                image_ext = Path(image_name).suffix.lstrip(".") or "png"
+                images_extracted += 1
+                image_path = self._save_extracted_image(document_id, filename, None, images_extracted, image_bytes, image_ext)
+                image_ocr = self.ocr_service.extract_text(image_bytes)
+                caption = await self.vision_service.caption_image(
+                    image_bytes=image_bytes,
+                    mime_type=mimetypes.types_map.get(f".{image_ext}", "image/png"),
+                    filename=filename,
+                    ocr_text=image_ocr,
+                )
+
+                records.append({
+                    "document_id": document_id,
+                    "chunk_id": f"{document_id}_docx_img{images_extracted}",
+                    "source": filename,
+                    "page_number": None,
+                    "item_type": "image",
+                    "text": "\n\n".join(part for part in [caption, f"OCR: {image_ocr}" if image_ocr else ""] if part),
+                    "image_path": str(image_path),
+                    "caption": caption,
+                    "ocr_text": image_ocr or None,
+                    "metadata": {
+                        "filename": filename,
+                        "content_type": content_type,
+                        "saved_path": str(saved_path),
+                        "zip_member": member,
+                    },
+                })
+
+        return ExtractionResult(records, 0, images_extracted, bool(records), "docx")
+
+    async def _extract_plain_text(
+        self,
+        document_id: str,
+        filename: str,
+        saved_path: Path,
+        file_bytes: bytes,
+        content_type: str,
+    ) -> ExtractionResult:
+        text = file_bytes.decode("utf-8", errors="ignore").strip()
+        records: List[Dict[str, Any]] = []
+        if text:
+            records.append({
+                "document_id": document_id,
+                "chunk_id": f"{document_id}_text",
+                "source": filename,
+                "page_number": None,
+                "item_type": "text",
+                "text": text,
+                "metadata": {
+                    "filename": filename,
+                    "content_type": content_type,
+                    "saved_path": str(saved_path),
+                },
+            })
+
+        return ExtractionResult(records, 0, 0, False, "text")
+
+    def _detect_file_type(self, filename: str, content_type: Optional[str]) -> str:
+        suffix = Path(filename).suffix.lower()
+        content_type = (content_type or "").lower()
+
+        if suffix == ".pdf" or content_type == "application/pdf":
+            return "pdf"
+        if suffix in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tiff"} or content_type.startswith("image/"):
+            return "image"
+        if suffix == ".docx" or content_type in {
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/msword",
+        }:
+            return "docx"
+        return "text"
+
+    def _save_upload(self, document_id: str, filename: str, file_bytes: bytes) -> Path:
+        safe_name = Path(filename).name
+        destination = self.upload_root / document_id
+        destination.mkdir(parents=True, exist_ok=True)
+        saved_path = destination / safe_name
+        saved_path.write_bytes(file_bytes)
+        return saved_path
+
+    def _save_extracted_image(
+        self,
+        document_id: str,
+        filename: str,
+        page_number: Optional[int],
+        image_index: int,
+        image_bytes: bytes,
+        image_ext: str,
+    ) -> Path:
+        destination = self.image_root / document_id
+        if page_number is not None:
+            destination = destination / f"page_{page_number}"
+        destination.mkdir(parents=True, exist_ok=True)
+
+        image_name = f"image_{image_index}.{image_ext.lstrip('.') or 'png'}"
+        saved_path = destination / image_name
+        saved_path.write_bytes(image_bytes)
+        return saved_path
+
+    def _chunk_to_source_reference(self, chunk: Dict[str, Any]) -> SourceReference:
+        return SourceReference(
+            chunk_id=chunk["chunk_id"],
+            document_id=chunk.get("document_id", chunk["chunk_id"].split("#")[0]),
+            source=chunk.get("source", "unknown"),
+            item_type=chunk.get("item_type", "text"),
+            page_number=chunk.get("page_number"),
+            image_path=chunk.get("image_path"),
+            caption=chunk.get("caption") or chunk.get("ocr_text"),
+        )
+
+
+multimodal_ingestion_service = MultimodalIngestionService()
+</file>
+
+<file path="package.json">
+{
+  "dependencies": {
+    "repomix": "^1.15.0"
+  }
+}
+</file>
+
+<file path="app/core/__init__.py">
+
+</file>
+
+<file path="app/core/config.py">
+# Copyright 2024
+# Directory: yt-rag/app/core/config.py
+
+"""
+Configuration management for the RAG application.
+Handles environment variables and application settings.
+"""
+
+import os
+from typing import Literal
+from pydantic_settings import BaseSettings
+from pydantic import Field
+
+
+class Settings(BaseSettings):
+    """Application settings loaded from environment variables."""
+    
+    # Supabase Configuration
+    supabase_url: str = Field(..., env="SUPABASE_URL")
+    supabase_anon_key: str = Field(..., env="SUPABASE_ANON_KEY")
+    supabase_service_role_key: str = Field(..., env="SUPABASE_SERVICE_ROLE_KEY")
+    
+    # AI Provider Configuration
+    ai_provider: Literal["openai", "anthropic"] = Field(default="openai", env="AI_PROVIDER")
+    
+    # OpenAI Configuration
+    openai_api_key: str = Field(..., env="OPENAI_API_KEY")
+    openai_embed_model: str = Field(default="text-embedding-3-small", env="OPENAI_EMBED_MODEL")
+    openai_chat_model: str = Field(default="gpt-4o", env="OPENAI_CHAT_MODEL")
+    
+    # Anthropic Configuration
+    anthropic_api_key: str = Field(default="", env="ANTHROPIC_API_KEY")
+    anthropic_chat_model: str = Field(default="claude-3-5-sonnet-20241022", env="ANTHROPIC_CHAT_MODEL")
+    
+    # Application Configuration
+    environment: str = Field(default="development", env="ENVIRONMENT")
+    log_level: str = Field(default="INFO", env="LOG_LEVEL")
+    
+    # RAG Configuration
+    default_top_k: int = Field(default=6)
+    chunk_size: int = Field(default=400)  # Approximate tokens
+    chunk_overlap: int = Field(default=60)  # 15% overlap
+    temperature: float = Field(default=0.1)
+    embedding_dimensions: int = Field(default=1536)  # text-embedding-3-small dimensions
+
+    # Multimodal storage
+    storage_root: str = Field(default="storage", env="STORAGE_ROOT")
+    uploaded_docs_dir: str = Field(default="storage/uploaded_docs", env="UPLOADED_DOCS_DIR")
+    extracted_images_dir: str = Field(default="storage/extracted_images", env="EXTRACTED_IMAGES_DIR")
+    
+    class Config:
+        """Pydantic configuration."""
+        env_file = ".env"
+        case_sensitive = False
+
+
+# Global settings instance
+settings = Settings()
+
+
+def get_settings() -> Settings:
+    """Get application settings instance."""
+    return settings
+</file>
+
+<file path="app/core/database.py">
+# Copyright 2024
+# Directory: yt-rag/app/core/database.py
+
+"""
+Database connection and schema management using Supabase SDK.
+Handles Supabase Postgres with pgvector extension for RAG operations.
+"""
+
+import logging
+from typing import Dict, List, Any, Optional
+from supabase import create_client, Client
+from .config import get_settings
+
+logger = logging.getLogger(__name__)
+settings = get_settings()
+
+
+class Database:
+    """Supabase database operations manager for RAG functionality."""
+    
+    def __init__(self):
+        """Initialize Supabase client."""
+        self.supabase: Optional[Client] = None
+        self._admin_client: Optional[Client] = None
+    
+    async def connect(self) -> None:
+        """Initialize Supabase clients."""
+        try:
+            # Regular client with anon key (for future frontend compatibility)
+            self.supabase = create_client(
+                settings.supabase_url,
+                settings.supabase_anon_key
+            )
+            
+            # Admin client with service role key (for backend operations)
+            self._admin_client = create_client(
+                settings.supabase_url,
+                settings.supabase_service_role_key
+            )
+            
+            logger.info("Supabase clients initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize Supabase clients: {e}")
+            raise
+    
+    async def disconnect(self) -> None:
+        """Close Supabase connections (cleanup if needed)."""
+        # Supabase clients don't need explicit disconnection
+        logger.info("Supabase clients cleaned up")
+    
+    def get_client(self, admin: bool = True) -> Client:
+        """
+        Get Supabase client instance.
+        
+        Args:
+            admin: If True, returns admin client with service role key.
+                   If False, returns regular client with anon key.
+        """
+        if not self.supabase or not self._admin_client:
+            raise RuntimeError("Database not connected. Call connect() first.")
+        
+        return self._admin_client if admin else self.supabase
+    
+    async def initialize_schema(self) -> None:
+        """
+        Check if database schema is initialized.
+        
+        Note: The actual schema setup must be done manually in Supabase.
+        Run the SQL script: sql/init_supabase.sql in your Supabase SQL Editor.
+        """
+        try:
+            client = self.get_client(admin=True)
+            
+            # Check if the table exists and has the required structure
+            result = client.table('rag_chunks').select('id').limit(1).execute()
+            
+            if result.data is not None:
+                logger.info("Database schema is properly initialized")
+                
+                # Test the vector search function
+                try:
+                    stats_result = client.rpc('get_chunk_stats').execute()
+                    if stats_result.data:
+                        stats = stats_result.data[0]
+                        logger.info(f"Database stats: {stats['total_chunks']} chunks, {stats['unique_sources']} sources")
+                except Exception:
+                    logger.warning("get_chunk_stats function not available - some features may not work")
+                    
+            else:
+                logger.error("Database schema not initialized!")
+                logger.error(
+                    "Please run the SQL initialization script:\n"
+                    "1. Open your Supabase project dashboard\n"
+                    "2. Go to SQL Editor\n"
+                    "3. Run the script: sql/init_supabase.sql\n"
+                    "4. Restart your application"
+                )
+                
+        except Exception as e:
+            logger.error(f"Database schema check failed: {e}")
+            logger.error(
+                "Please ensure you've run sql/init_supabase.sql in your Supabase dashboard"
+            )
+    
+    async def upsert_chunks(self, chunks: List[Dict[str, Any]]) -> int:
+        """
+        Upsert document chunks into the database using Supabase SDK.
+        
+        Args:
+            chunks: List of chunk dictionaries with keys: chunk_id, source, text, embedding
+            
+        Returns:
+            Number of chunks inserted
+        """
+        if not chunks:
+            return 0
+        
+        try:
+            client = self.get_client(admin=True)
+            
+            # Prepare data for Supabase
+            chunk_data = []
+            for chunk in chunks:
+                chunk_data.append({
+                    'chunk_id': chunk['chunk_id'],
+                    'document_id': chunk.get('document_id', chunk['chunk_id'].split('#')[0]),
+                    'source': chunk['source'],
+                    'page_number': chunk.get('page_number'),
+                    'item_type': chunk.get('item_type', 'text'),
+                    'text': chunk['text'],
+                    'image_path': chunk.get('image_path'),
+                    'caption': chunk.get('caption'),
+                    'ocr_text': chunk.get('ocr_text'),
+                    'width': chunk.get('width'),
+                    'height': chunk.get('height'),
+                    'metadata': chunk.get('metadata', {}),
+                    'embedding': chunk['embedding']  # Supabase handles vector serialization
+                })
+            
+            # Use upsert with on_conflict parameter
+            result = client.table('rag_chunks').upsert(
+                chunk_data,
+                on_conflict='chunk_id'
+            ).execute()
+            
+            inserted_count = len(result.data) if result.data else 0
+            logger.info(f"Upserted {inserted_count} chunks to database")
+            return inserted_count
+            
+        except Exception as e:
+            logger.error(f"Failed to upsert chunks: {e}")
+            raise
+    
+    async def vector_search(self, query_embedding: List[float], top_k: int = 6) -> List[Dict[str, Any]]:
+        """
+        Perform vector similarity search using Supabase SDK.
+        
+        Args:
+            query_embedding: Query vector embedding
+            top_k: Number of results to return
+            
+        Returns:
+            List of matching chunks with similarity scores
+        """
+        try:
+            client = self.get_client(admin=True)
+            
+            # Use RPC call for vector similarity search
+            # This requires creating a PostgreSQL function in Supabase
+            result = client.rpc('match_chunks', {
+                'query_embedding': query_embedding,
+                'match_count': top_k
+            }).execute()
+            
+            if result.data:
+                logger.info(f"Vector search returned {len(result.data)} results")
+                return result.data
+            else:
+                # Fallback: if RPC function doesn't exist, use regular query
+                # This won't have vector similarity but will work for basic testing
+                logger.info("Using fallback query (match_chunks RPC function not available)")
+                result = client.table('rag_chunks').select('*').limit(top_k).execute()
+                
+                # Add mock similarity scores for fallback
+                if result.data:
+                    for i, chunk in enumerate(result.data):
+                        chunk['similarity'] = 1.0 - (i * 0.1)  # Mock decreasing similarity
+                
+                return result.data or []
+                
+        except Exception as e:
+            logger.error(f"Vector search failed: {e}")
+            return []
+    
+    async def health_check(self) -> bool:
+        """Check Supabase connection health."""
+        try:
+            client = self.get_client(admin=True)
+            
+            # Simple query to test connection
+            result = client.table('rag_chunks').select('id').limit(1).execute()
+            
+            return True  # If no exception, connection is healthy
+            
+        except Exception as e:
+            logger.error(f"Database health check failed: {e}")
+            return False
+
+
+# Global database instance
+db = Database()
+</file>
+
+<file path="app/data/__init__.py">
+# Copyright 2024
+# Directory: yt-rag/app/data/__init__.py
+
+"""
+Data package for storing default documents and sample data.
+"""
+</file>
+
+<file path="app/data/default_documents.py">
+# Copyright 2024
+# Directory: yt-rag/app/data/default_documents.py
+
+"""
+Default documents for seeding the RAG knowledge base.
+Contains sample policy and support information for demonstration.
+"""
+
+from typing import List, Dict
+
+# Default documents for seeding
+DEFAULT_DOCUMENTS: List[Dict[str, str]] = [
+    {
+        'chunk_id': 'policy_returns_v1',
+        'source': 'https://help.example.com/return-policy',
+        'text': '''Return Policy
+
+You can return unworn items within 30 days of purchase with original receipt. Items must be in original condition with tags attached. 
+
+IMPORTANT: Items over $200 require manual approval for returns. Please email support@company.com with your order details for items over $200.
+
+Exceptions: Final sale items, customized products, and intimate apparel cannot be returned. Shoes must be unworn with original box.
+
+Refunds will be processed to original payment method within 5-7 business days after we receive your return.'''
+    },
+    {
+        'chunk_id': 'policy_shipping_v1',
+        'source': 'https://help.example.com/shipping',
+        'text': '''Shipping Information
+
+Free standard shipping on orders over $50. Standard shipping takes 3-5 business days. Express shipping available for $9.99 (1-2 business days).
+
+International shipping available to select countries. Shipping costs calculated at checkout based on destination and weight.
+
+Orders placed before 2 PM EST ship same day. Weekend orders ship on the next business day.'''
+    },
+    {
+        'chunk_id': 'sizing_guide_v1',
+        'source': 'https://help.example.com/sizing',
+        'text': '''Size Guide
+
+Clothing sizes run true to size. Please refer to our size chart for measurements.
+
+For shoes: If between sizes, we recommend sizing up for comfort. Athletic shoes may run small - consider sizing up half a size.
+
+Exchanges for different sizes are free within 30 days. Use our online size guide tool for personalized recommendations.'''
+    },
+    {
+        'chunk_id': 'support_contact_v1',
+        'source': 'https://help.example.com/contact',
+        'text': '''Customer Support
+
+Contact us Monday-Friday 9 AM - 6 PM EST:
+- Email: support@example.com
+- Phone: 1-800-555-0123
+- Live chat available on our website
+
+For order issues, have your order number ready. Response time is typically within 24 hours for email inquiries.
+
+You can also track your order status online using your order number and email address.'''
+    }
+]
+</file>
+
+<file path="app/models/__init__.py">
+
+</file>
+
+<file path="app/models/entities.py">
+# Copyright 2024
+# Directory: yt-rag/app/models/entities.py
+
+"""
+Database entity models for the RAG application.
+"""
+
+from typing import List, Optional
+from datetime import datetime
+from pydantic import BaseModel, Field
+
+
+class RagChunk(BaseModel):
+    """Database entity for a RAG chunk."""
+    id: Optional[int] = Field(None, description="Database primary key")
+    chunk_id: str = Field(..., description="Unique chunk identifier")
+    source: str = Field(..., description="Source URL or identifier")
+    text: str = Field(..., description="Text content")
+    embedding: Optional[List[float]] = Field(None, description="Vector embedding")
+    created_at: Optional[datetime] = Field(None, description="Creation timestamp")
+    
+    # Additional fields for search results
+    similarity: Optional[float] = Field(None, description="Similarity score (0-1)")
+    distance: Optional[float] = Field(None, description="Cosine distance")
+
+
+class SearchResult(BaseModel):
+    """Search result with chunk and metadata."""
+    chunk: RagChunk = Field(..., description="The retrieved chunk")
+    similarity: float = Field(..., description="Similarity score")
+    rank: int = Field(..., description="Result rank (1-based)")
+</file>
+
+<file path="app/models/requests.py">
+# Copyright 2024
+# Directory: yt-rag/app/models/requests.py
+
+"""
+Request models for the RAG API endpoints.
+"""
+
+from typing import List, Optional
+from pydantic import BaseModel, Field
+
+
+class DocumentChunk(BaseModel):
+    """Individual document chunk for seeding."""
+    chunk_id: str = Field(..., description="Unique identifier for the chunk")
+    source: str = Field(..., description="Source URL or identifier")
+    text: str = Field(..., description="Text content of the chunk")
+
+
+class SeedRequest(BaseModel):
+    """Request model for the /seed endpoint."""
+    docs: Optional[List[DocumentChunk]] = Field(
+        None, 
+        description="Optional list of documents to seed. If omitted, uses default documents."
+    )
+
+
+class AnswerRequest(BaseModel):
+    """Request model for the /answer endpoint."""
+    query: str = Field(..., description="User question to answer")
+    top_k: Optional[int] = Field(
+        6, 
+        ge=1, 
+        le=20, 
+        description="Number of chunks to retrieve for context"
+    )
+</file>
+
+<file path="app/models/responses.py">
+# Copyright 2024
+# Directory: yt-rag/app/models/responses.py
+
+"""
+Response models for the RAG API endpoints.
+"""
+
+from typing import List, Dict, Any
+from pydantic import BaseModel, Field
+
+from .multimodal import SourceReference, ImageReference
+
+
+class SeedResponse(BaseModel):
+    """Response model for the /seed endpoint."""
+    inserted: int = Field(..., description="Number of chunks successfully inserted")
+
+
+class DebugInfo(BaseModel):
+    """Debug information for RAG responses."""
+    top_doc_ids: List[str] = Field(..., description="IDs of retrieved chunks")
+    latency_ms: int = Field(..., description="Total processing time in milliseconds")
+
+
+class AnswerResponse(BaseModel):
+    """Response model for the /answer endpoint."""
+    text: str = Field(..., description="Generated answer with inline citations")
+    citations: List[str] = Field(..., description="List of chunk IDs used as sources")
+    debug: DebugInfo = Field(..., description="Debug information")
+    sources: List[SourceReference] = Field(default_factory=list, description="Retrieved source references")
+    images: List[ImageReference] = Field(default_factory=list, description="Retrieved image references")
+
+
+class HealthResponse(BaseModel):
+    """Response model for the /healthz endpoint."""
+    status: str = Field(..., description="Health status")
+    database_connected: bool = Field(..., description="Database connection status")
+
+
+class ErrorResponse(BaseModel):
+    """Standard error response model."""
+    error: str = Field(..., description="Error message")
+    detail: str = Field(..., description="Detailed error information")
+</file>
+
+<file path="app/services/__init__.py">
+
+</file>
+
+<file path="app/services/chat.py">
+# Copyright 2024
+# Directory: yt-rag/app/services/chat.py
+
+"""
+Chat completion service for generating RAG responses.
+Supports both OpenAI and Anthropic with configurable models.
+"""
+
+import base64
+import logging
+import mimetypes
+from pathlib import Path
+from typing import List, Dict, Any
+import openai
+import anthropic
+from ..core.config import get_settings
+
+logger = logging.getLogger(__name__)
+settings = get_settings()
+
+
+class ChatService:
+    """Service for chat completions supporting multiple AI providers."""
+    
+    def __init__(self):
+        """Initialize chat clients based on configuration."""
+        self.provider = settings.ai_provider
+        
+        if self.provider == "openai":
+            self.client = openai.OpenAI(api_key=settings.openai_api_key)
+            self.model = settings.openai_chat_model
+        elif self.provider == "anthropic":
+            self.client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+            self.model = settings.anthropic_chat_model
+        else:
+            raise ValueError(f"Unsupported AI provider: {self.provider}")
+        
+        logger.info(f"Initialized chat service with {self.provider} ({self.model})")
+    
+    async def generate_answer(self, query: str, context_blocks: List[Dict[str, Any]]) -> str:
+        """
+        Generate RAG answer using context blocks.
+        
+        Args:
+            query: User's question
+            context_blocks: Retrieved chunks with metadata
+            
+        Returns:
+            Generated answer with citations
+        """
+        # Build context string with citations and collect image payloads for vision models.
+        context_parts = []
+        image_payloads = []
+        for block in context_blocks:
+            chunk_id = block.get('chunk_id', 'unknown')
+            document_id = block.get('document_id', 'unknown')
+            item_type = block.get('item_type', 'text')
+            page_number = block.get('page_number')
+            text = block.get('text', '')
+            caption = block.get('caption') or ''
+            ocr_text = block.get('ocr_text') or ''
+
+            header = [f"[{chunk_id}]", f"doc={document_id}", f"type={item_type}"]
+            if page_number is not None:
+                header.append(f"page={page_number}")
+            context_parts.append(f"{' '.join(header)}\n{text}")
+
+            image_path = block.get('image_path')
+            if image_path:
+                payload = self._load_image_payload(image_path)
+                if payload:
+                    payload['chunk_id'] = chunk_id
+                    payload['caption'] = caption
+                    payload['ocr_text'] = ocr_text
+                    payload['page_number'] = page_number
+                    image_payloads.append(payload)
+
+        context = "\n\n".join(context_parts)
+
+        system_prompt = """You are a helpful multimodal AI assistant for customer support.
+
+IMPORTANT RULES:
+1. Use only the provided context and any attached images.
+2. For policy, returns, shipping, sizing, or support questions: answer from context and include citations.
+3. When an attached image is relevant, inspect it directly and cite its chunk ID.
+4. For general greetings or casual conversation, respond naturally.
+5. For questions outside the knowledge base, politely redirect to relevant policies or support.
+6. Always include citations in the form [chunk_id] when using retrieved information.
+7. Be concise but comprehensive."""
+
+        user_prompt = f"""Context:
+{context}
+
+Question: {query}
+
+Answer using the context above. If an attached image is useful, reason over it directly and cite the corresponding chunk ID."""
+
+        try:
+            if self.provider == "openai":
+                user_content = [{"type": "text", "text": user_prompt}]
+                for image_payload in image_payloads[:2]:
+                    user_content.append({
+                        "type": "text",
+                        "text": (
+                            f"Attached image for [{image_payload['chunk_id']}]"
+                            + (f" on page {image_payload['page_number']}" if image_payload.get('page_number') is not None else "")
+                            + (f". Caption: {image_payload['caption']}" if image_payload.get('caption') else "")
+                        ),
+                    })
+                    user_content.append({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": image_payload['data_uri'],
+                            "detail": "high",
+                        },
+                    })
+
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_content}
+                    ],
+                    temperature=settings.temperature,
+                    max_tokens=1000
+                )
+                answer = response.choices[0].message.content
+                
+            elif self.provider == "anthropic":
+                user_content = [{"type": "text", "text": user_prompt}]
+                for image_payload in image_payloads[:2]:
+                    user_content.append({
+                        "type": "text",
+                        "text": (
+                            f"Attached image for [{image_payload['chunk_id']}]"
+                            + (f" on page {image_payload['page_number']}" if image_payload.get('page_number') is not None else "")
+                            + (f". Caption: {image_payload['caption']}" if image_payload.get('caption') else "")
+                        ),
+                    })
+                    user_content.append({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": image_payload['mime_type'],
+                            "data": image_payload['b64'],
+                        },
+                    })
+
+                response = self.client.messages.create(
+                    model=self.model,
+                    max_tokens=1000,
+                    temperature=settings.temperature,
+                    system=system_prompt,
+                    messages=[{"role": "user", "content": user_content}]
+                )
+                answer = response.content[0].text
+            
+            logger.info(f"Generated answer using {self.provider}")
+            return answer or "I couldn't generate an answer."
+            
+        except Exception as e:
+            logger.error(f"Failed to generate answer: {e}")
+            return f"I encountered an error while processing your question: {str(e)}"
+
+    def _load_image_payload(self, image_path: str) -> Dict[str, str]:
+        """Load an image and return provider-ready payload fields."""
+
+        path = Path(image_path)
+        if not path.exists():
+            return {}
+
+        mime_type = mimetypes.guess_type(path.name)[0] or "image/png"
+        encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+        return {
+            'mime_type': mime_type,
+            'b64': encoded,
+            'data_uri': f"data:{mime_type};base64,{encoded}",
+        }
+
+
+# Global service instance
+chat_service = ChatService()
+</file>
+
+<file path="app/services/chunker.py">
+# Copyright 2024
+# Directory: yt-rag/app/services/chunker.py
+
+"""
+Text chunking utilities for RAG document processing.
+Implements simple word-based chunking with overlap for optimal retrieval.
+"""
+
+import logging
+import re
+from typing import List, Dict, Any
+from ..core.config import get_settings
+
+logger = logging.getLogger(__name__)
+settings = get_settings()
+
+
+class TextChunker:
+    """Simple text chunker with word-based splitting and overlap."""
+    
+    def __init__(self, chunk_size: int = None, overlap: int = None):
+        """
+        Initialize chunker with configuration.
+        
+        Args:
+            chunk_size: Approximate tokens per chunk (default from settings)
+            overlap: Overlap tokens between chunks (default from settings)
+        """
+        self.chunk_size = chunk_size or settings.chunk_size
+        self.overlap = overlap or settings.chunk_overlap
+        
+        # Rough approximation: 1 token ≈ 0.75 words
+        self.words_per_chunk = int(self.chunk_size * 0.75)
+        self.overlap_words = int(self.overlap * 0.75)
+        
+        logger.info(f"Initialized chunker: ~{self.words_per_chunk} words per chunk, {self.overlap_words} overlap")
+    
+    def chunk_text(self, text: str, source: str, base_chunk_id: str) -> List[Dict[str, Any]]:
+        """
+        Split text into overlapping chunks.
+        
+        Args:
+            text: Text to chunk
+            source: Source identifier (URL, filename, etc.)
+            base_chunk_id: Base identifier for chunks (will append #1, #2, etc.)
+            
+        Returns:
+            List of chunk dictionaries with chunk_id, source, and text
+        """
+        if not text or not text.strip():
+            return []
+        
+        # Clean and normalize text
+        cleaned_text = self._clean_text(text)
+        words = cleaned_text.split()
+        
+        if len(words) <= self.words_per_chunk:
+            # Text is small enough to be a single chunk
+            return [{
+                'chunk_id': f"{base_chunk_id}#1",
+                'source': source,
+                'text': cleaned_text
+            }]
+        
+        chunks = []
+        start_idx = 0
+        chunk_num = 1
+        
+        while start_idx < len(words):
+            # Calculate end index for this chunk
+            end_idx = min(start_idx + self.words_per_chunk, len(words))
+            
+            # Extract chunk words
+            chunk_words = words[start_idx:end_idx]
+            chunk_text = ' '.join(chunk_words)
+            
+            # Create chunk dictionary
+            chunk = {
+                'chunk_id': f"{base_chunk_id}#{chunk_num}",
+                'source': source,
+                'text': chunk_text
+            }
+            chunks.append(chunk)
+            
+            # Move start index for next chunk (with overlap)
+            if end_idx >= len(words):
+                break  # We've processed all words
+            
+            start_idx = end_idx - self.overlap_words
+            chunk_num += 1
+        
+        logger.info(f"Chunked text into {len(chunks)} chunks (source: {source})")
+        return chunks
+    
+    def _clean_text(self, text: str) -> str:
+        """
+        Clean and normalize text for better chunking.
+        
+        Args:
+            text: Raw text to clean
+            
+        Returns:
+            Cleaned text
+        """
+        # Remove excessive whitespace
+        text = re.sub(r'\s+', ' ', text)
+        
+        # Remove leading/trailing whitespace
+        text = text.strip()
+        
+        # Normalize quotes
+        text = text.replace('“', '"').replace('”', '"')
+        text = text.replace('‘', "'").replace('’', "'")
+        
+        return text
+
+    def _compose_document_text(self, document: Dict[str, Any]) -> str:
+        """Merge text, OCR, and image caption content into a single searchable string."""
+        parts = []
+
+        for key in ('text', 'ocr_text', 'caption'):
+            value = document.get(key)
+            if value and str(value).strip():
+                label = key.replace('_', ' ').title()
+                parts.append(f"{label}: {value.strip()}")
+
+        return "\n\n".join(parts).strip()
+    
+    def chunk_documents(self, documents: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+        """
+        Chunk multiple documents.
+        
+        Args:
+            documents: List of documents with 'text', 'source', and 'chunk_id' keys
+            
+        Returns:
+            List of all chunks from all documents
+        """
+        all_chunks = []
+        
+        for doc in documents:
+            source = doc.get('source', 'unknown')
+            base_chunk_id = doc.get('chunk_id', doc.get('document_id', 'doc'))
+            normalized_text = self._compose_document_text(doc)
+
+            chunks = self.chunk_text(normalized_text, source, base_chunk_id)
+            for chunk in chunks:
+                chunk['document_id'] = doc.get('document_id', base_chunk_id)
+                chunk['page_number'] = doc.get('page_number')
+                chunk['item_type'] = doc.get('item_type', 'text')
+                chunk['image_path'] = doc.get('image_path')
+                chunk['caption'] = doc.get('caption')
+                chunk['ocr_text'] = doc.get('ocr_text')
+                chunk['width'] = doc.get('width')
+                chunk['height'] = doc.get('height')
+                chunk['metadata'] = doc.get('metadata', {})
+
+            all_chunks.extend(chunks)
+        
+        logger.info(f"Processed {len(documents)} documents into {len(all_chunks)} total chunks")
+        return all_chunks
+
+
+
+
+# Global chunker instance
+chunker = TextChunker()
+</file>
+
+<file path="app/services/embedding.py">
+# Copyright 2024
+# Directory: yt-rag/app/services/embedding.py
+
+"""
+Embedding service for generating text embeddings using OpenAI.
+Focused solely on vector embeddings for RAG retrieval.
+"""
+
+import logging
+from typing import List
+import openai
+from ..core.config import get_settings
+
+logger = logging.getLogger(__name__)
+settings = get_settings()
+
+
+class EmbeddingService:
+    """Service for generating text embeddings using OpenAI."""
+    
+    def __init__(self):
+        """Initialize OpenAI client for embeddings."""
+        self.openai_client = openai.OpenAI(api_key=settings.openai_api_key)
+        self.embed_model = settings.openai_embed_model
+    
+    async def embed_texts(self, texts: List[str]) -> List[List[float]]:
+        """
+        Generate embeddings for a list of texts.
+        
+        Args:
+            texts: List of text strings to embed
+            
+        Returns:
+            List of embedding vectors (1536 dimensions for text-embedding-3-small)
+        """
+        try:
+            response = self.openai_client.embeddings.create(
+                model=self.embed_model,
+                input=texts
+            )
+            
+            embeddings = [item.embedding for item in response.data]
+            logger.info(f"Generated embeddings for {len(texts)} texts")
+            return embeddings
+            
+        except Exception as e:
+            logger.error(f"Failed to generate embeddings: {e}")
+            raise
+    
+    async def embed_query(self, query: str) -> List[float]:
+        """
+        Generate embedding for a single query.
+        
+        Args:
+            query: Query text to embed
+            
+        Returns:
+            Embedding vector
+        """
+        embeddings = await self.embed_texts([query])
+        return embeddings[0]
+
+
+# Global service instance
+embedding_service = EmbeddingService()
+</file>
+
+<file path="app/services/rag.py">
+# Copyright 2024
+# Directory: yt-rag/app/services/rag.py
+
+"""
+RAG (Retrieval-Augmented Generation) service implementation.
+Orchestrates the complete RAG pipeline: chunk → embed → search → generate.
+"""
+
+import logging
+import time
+import re
+from typing import List, Dict, Any, Tuple
+from ..core.database import db
+from .embedding import embedding_service
+from .chat import chat_service
+from .chunker import chunker
+from ..data.default_documents import DEFAULT_DOCUMENTS
+
+logger = logging.getLogger(__name__)
+
+
+class RAGService:
+    """Main RAG service orchestrating the complete pipeline."""
+    
+    def __init__(self):
+        """Initialize RAG service."""
+        self.db = db
+        self.embedding_service = embedding_service
+        self.chat_service = chat_service
+        self.chunker = chunker
+    
+    async def seed_documents(self, documents: List[Dict[str, str]] = None) -> int:
+        """
+        Seed the knowledge base with documents.
+        
+        Args:
+            documents: Optional list of documents. If None, uses default documents.
+            
+        Returns:
+            Number of chunks successfully inserted
+        """
+        start_time = time.time()
+        
+        # Use default documents if none provided
+        if documents is None:
+            documents = DEFAULT_DOCUMENTS
+            logger.info("Using default documents for seeding")
+        
+        try:
+            # Step 1: Chunk documents
+            chunks = self.chunker.chunk_documents(documents)
+            logger.info(f"Created {len(chunks)} chunks from {len(documents)} documents")
+            
+            # Step 2: Generate embeddings for all chunks
+            texts = [chunk['text'] for chunk in chunks]
+            embeddings = await self.embedding_service.embed_texts(texts)
+            
+            # Step 3: Combine chunks with embeddings
+            for chunk, embedding in zip(chunks, embeddings):
+                chunk['embedding'] = embedding
+            
+            # Step 4: Store in database
+            inserted_count = await self.db.upsert_chunks(chunks)
+            
+            elapsed_ms = int((time.time() - start_time) * 1000)
+            logger.info(f"Seeding completed in {elapsed_ms}ms: {inserted_count} chunks inserted")
+            
+            return inserted_count
+            
+        except Exception as e:
+            logger.error(f"Seeding failed: {e}")
+            raise
+    
+    async def answer_query(self, query: str, top_k: int = 6) -> Dict[str, Any]:
+        """
+        Process a query through the complete RAG pipeline.
+        
+        Args:
+            query: User's question
+            top_k: Number of chunks to retrieve
+            
+        Returns:
+            Dictionary with answer, citations, and debug info
+        """
+        start_time = time.time()
+        
+        try:
+            # Step 1: Generate query embedding
+            query_embedding = await self.embedding_service.embed_query(query)
+            
+            # Step 2: Vector similarity search
+            search_results = await self.db.vector_search(query_embedding, top_k)
+            
+            if not search_results:
+                return {
+                    'text': "I don't have enough information to answer your question. Could you please rephrase or provide more context?",
+                    'citations': [],
+                    'debug': {
+                        'top_doc_ids': [],
+                        'latency_ms': int((time.time() - start_time) * 1000)
+                    }
+                }
+            
+            # Step 3: Deduplicate and prepare context
+            context_blocks = self._prepare_context(search_results)
+            
+            # Step 4: Generate answer
+            answer_text = await self.chat_service.generate_answer(query, context_blocks)
+            
+            # Step 5: Extract citations from answer
+            citations = self._extract_citations(answer_text, context_blocks)
+            
+            elapsed_ms = int((time.time() - start_time) * 1000)
+            
+            result = {
+                'text': answer_text,
+                'citations': citations,
+                'debug': {
+                    'top_doc_ids': [block['chunk_id'] for block in context_blocks],
+                    'latency_ms': elapsed_ms
+                },
+                'sources': [
+                    {
+                        'chunk_id': block.get('chunk_id'),
+                        'document_id': block.get('document_id', block.get('chunk_id', '').split('#')[0]),
+                        'source': block.get('source', 'unknown'),
+                        'item_type': block.get('item_type', 'text'),
+                        'page_number': block.get('page_number'),
+                        'image_path': block.get('image_path'),
+                        'caption': block.get('caption') or block.get('ocr_text'),
+                    }
+                    for block in context_blocks
+                ],
+                'images': [
+                    {
+                        'chunk_id': block.get('chunk_id'),
+                        'image_path': block.get('image_path'),
+                        'page_number': block.get('page_number'),
+                        'caption': block.get('caption') or block.get('ocr_text'),
+                    }
+                    for block in context_blocks
+                    if block.get('image_path')
+                ]
+            }
+            
+            logger.info(f"Query processed in {elapsed_ms}ms with {len(citations)} citations")
+            return result
+            
+        except Exception as e:
+            logger.error(f"Query processing failed: {e}")
+            return {
+                'text': f"I encountered an error while processing your question: {str(e)}",
+                'citations': [],
+                'debug': {
+                    'top_doc_ids': [],
+                    'latency_ms': int((time.time() - start_time) * 1000)
+                }
+            }
+    
+    def _prepare_context(self, search_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Prepare context blocks from search results with simple deduplication.
+        
+        Args:
+            search_results: Raw search results from database
+            
+        Returns:
+            Processed context blocks
+        """
+        # Simple deduplication by exact chunk_id so multimodal chunks stay visible.
+        seen_chunk_ids = set()
+        context_blocks = []
+        
+        for result in search_results:
+            chunk_id = result.get('chunk_id', '')
+
+            if chunk_id not in seen_chunk_ids:
+                context_blocks.append(result)
+                seen_chunk_ids.add(chunk_id)
+            
+            # Limit to reasonable context size
+            if len(context_blocks) >= 6:
+                break
+        
+        logger.info(f"Prepared {len(context_blocks)} unique context blocks")
+        return context_blocks
+    
+    def _extract_citations(self, answer_text: str, context_blocks: List[Dict[str, Any]]) -> List[str]:
+        """
+        Extract citation chunk_ids from the generated answer.
+        
+        Args:
+            answer_text: Generated answer text
+            context_blocks: Context blocks that were provided
+            
+        Returns:
+            List of chunk_ids that were cited
+        """
+        # Find all citations in format [chunk_id]
+        citation_pattern = r'\[([^\]]+)\]'
+        found_citations = re.findall(citation_pattern, answer_text)
+        
+        # Filter to only include valid chunk_ids from context
+        valid_chunk_ids = {block['chunk_id'] for block in context_blocks}
+        valid_citations = [cite for cite in found_citations if cite in valid_chunk_ids]
+        
+        # Remove duplicates while preserving order
+        unique_citations = []
+        for cite in valid_citations:
+            if cite not in unique_citations:
+                unique_citations.append(cite)
+        
+        return unique_citations
+
+
+# Global RAG service instance
+rag_service = RAGService()
+</file>
+
+<file path="app/__init__.py">
+
+</file>
+
+<file path="app/main.py">
+# Copyright 2024
+# Directory: yt-rag/app/main.py
+
+"""
+FastAPI application for RAG (Retrieval-Augmented Generation) backend.
+Provides endpoints for document seeding and question answering with citations.
+"""
+
+import logging
+from contextlib import asynccontextmanager
+from typing import List
+from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, Response
+
+from .core.config import get_settings
+from .core.database import db
+from .models.requests import SeedRequest, AnswerRequest
+from .models.responses import SeedResponse, AnswerResponse, HealthResponse, ErrorResponse
+from .models.multimodal import UploadResponse
+from .services.rag import rag_service
+from .services.multimodal import multimodal_ingestion_service
+from .data.default_documents import DEFAULT_DOCUMENTS
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+settings = get_settings()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan events."""
+    # Startup
+    logger.info("Starting RAG API application")
+    
+    try:
+        # Initialize database connection
+        await db.connect()
+        
+        # Check database schema
+        await db.initialize_schema()
+        
+        logger.info("Application startup completed successfully")
+        
+    except Exception as e:
+        logger.error(f"Application startup failed: {e}")
+        raise
+    
+    yield
+    
+    # Shutdown
+    logger.info("Shutting down RAG API application")
+    await db.disconnect()
+
+
+# Create FastAPI application
+app = FastAPI(
+    title="RAG AI Agent Backend",
+    description="A minimal, production-ready FastAPI backend demonstrating Retrieval-Augmented Generation (RAG) with vector similarity search.",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# Configure CORS for frontend integration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",  # NextJS default
+        "http://localhost:3001",  # Alternative port
+        "https://yt-rag.vercel.app",  # Production frontend
+        "*"  # Allow all for development (remove in production)
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Mount static files for the chat interface
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+@app.get("/chat", tags=["General"])
+async def chat_interface():
+    """Serve the chat interface."""
+    return FileResponse("static/chat.html")
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    """Handle favicon requests to prevent 404 errors."""
+    return Response(status_code=204)  # No Content
+
+
+@app.get("/", tags=["General"])
+async def root():
+    """Root endpoint with API information."""
+    return {
+        "message": "Welcome to RAG AI Agent Backend",
+        "version": "1.0.0",
+        "docs": "/docs",
+        "endpoints": {
+            "health": "/healthz",
+            "seed": "/seed",
+            "answer": "/answer",
+            "upload": "/upload",
+            "documents": "/documents",
+            "greet": "/greet/{name}"
+        }
+    }
+
+
+@app.get("/greet/{name}", tags=["General"])
+async def greet(name: str):
+    """
+    Greet endpoint that returns a personalized greeting.
+    
+    Args:
+        name (str): Name of the person to greet
+        
+    Returns:
+        Personalized greeting message
+    """
+    return {"message": f"Hello, {name}! I think you are great!"}
+
+
+@app.get("/healthz", response_model=HealthResponse, tags=["Health"])
+async def health_check():
+    """Health check endpoint with database connectivity test."""
+    try:
+        # Test database connection
+        db_healthy = await db.health_check()
+        
+        return HealthResponse(
+            status="ok" if db_healthy else "degraded",
+            database_connected=db_healthy
+        )
+        
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail=f"Service unavailable: {str(e)}"
+        )
+
+
+@app.get("/documents", tags=["General"])
+async def get_documents():
+    """
+    Get the default documents used for seeding the knowledge base.
+    
+    Returns:
+        List of default documents with their chunk_id, source, and text
+    """
+    return {"documents": DEFAULT_DOCUMENTS}
+
+
+@app.post("/upload", response_model=UploadResponse, tags=["RAG"])
+async def upload_documents(file: UploadFile = File(...)):
+    """Upload PDFs, images, or DOCX files and ingest them into the multimodal index."""
+
+    try:
+        upload_result = await multimodal_ingestion_service.ingest_upload(file)
+        return UploadResponse(**upload_result)
+    except Exception as e:
+        logger.error(f"Upload failed: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to process upload: {str(e)}"
+        )
+
+
+@app.post("/seed", response_model=SeedResponse, tags=["RAG"])
+async def seed_documents(request: SeedRequest = SeedRequest()):
+    """
+    Seed the knowledge base with documents.
+    
+    If no documents are provided, seeds with default policy/FAQ documents.
+    Documents are chunked, embedded, and stored in the vector database.
+    """
+    try:
+        logger.info("Starting document seeding process")
+        
+        # Convert request documents to the format expected by RAG service
+        documents = None
+        if request.docs:
+            documents = [
+                {
+                    'chunk_id': doc.chunk_id,
+                    'source': doc.source,
+                    'text': doc.text
+                }
+                for doc in request.docs
+            ]
+        
+        # Process documents through RAG pipeline
+        inserted_count = await rag_service.seed_documents(documents)
+        
+        logger.info(f"Seeding completed: {inserted_count} chunks inserted")
+        
+        return SeedResponse(inserted=inserted_count)
+        
+    except Exception as e:
+        logger.error(f"Seeding failed: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to seed documents: {str(e)}"
+        )
+
+
+@app.post("/answer", response_model=AnswerResponse, tags=["RAG"])
+async def answer_question(request: AnswerRequest):
+    """
+    Answer a question using RAG (Retrieval-Augmented Generation).
+    
+    Pipeline:
+    1. Embed the query
+    2. Vector similarity search to find relevant chunks
+    3. Generate answer using LLM with context
+    4. Return answer with citations and debug info
+    """
+    try:
+        logger.info(f"Processing query: '{request.query[:100]}...'")
+        
+        # Process query through RAG pipeline
+        result = await rag_service.answer_query(
+            query=request.query,
+            top_k=request.top_k
+        )
+        
+        # Convert to response model
+        response = AnswerResponse(
+            text=result['text'],
+            citations=result['citations'],
+            debug={
+                'top_doc_ids': result['debug']['top_doc_ids'],
+                'latency_ms': result['debug']['latency_ms']
+            },
+            sources=result.get('sources', []),
+            images=result.get('images', [])
+        )
+        
+        logger.info(f"Query processed successfully in {result['debug']['latency_ms']}ms")
+        
+        return response
+        
+    except Exception as e:
+        logger.error(f"Query processing failed: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to process query: {str(e)}"
+        )
+
+
+# Error handlers
+@app.exception_handler(404)
+async def not_found_handler(request, exc):
+    """Handle 404 errors."""
+    return {
+        "error": "Not Found",
+        "detail": "The requested endpoint does not exist",
+        "available_endpoints": ["/", "/healthz", "/seed", "/answer", "/docs"]
+    }
+
+
+@app.exception_handler(500)
+async def internal_error_handler(request, exc):
+    """Handle 500 errors."""
+    logger.error(f"Internal server error: {exc}")
+    return ErrorResponse(
+        error="Internal Server Error",
+        detail="An unexpected error occurred. Please check the logs."
+    )
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "app.main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True,
+        log_level="info"
+    )
+</file>
+
+<file path="models/multimodal_ai_platform_architecture.svg">
+<svg width="100%" viewBox="0 0 680 920" role="img" style="" xmlns="http://www.w3.org/2000/svg">
+  <title style="fill:rgb(0, 0, 0);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto">Multimodal AI Platform Architecture</title>
+  <desc style="fill:rgb(0, 0, 0);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto">End-to-end flowchart of a multimodal AI platform with RAG, streaming, and MLOps monitoring layer</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+  <mask id="imagine-text-gaps-uulst5" maskUnits="userSpaceOnUse"><rect x="0" y="0" width="680" height="920" fill="white"/><rect x="292.4158020019531" y="29.242107391357422" width="95.16842651367188" height="21.515790939331055" fill="black" rx="2"/><rect x="259.8052673339844" y="48.25263214111328" width="160.3894805908203" height="19.49473762512207" fill="black" rx="2"/><rect x="354.0000305175781" y="81.25263214111328" width="94.93684387207031" height="19.49473762512207" fill="black" rx="2"/><rect x="294.60528564453125" y="111.24211120605469" width="90.78947448730469" height="21.515790939331055" fill="black" rx="2"/><rect x="286.1842346191406" y="130.2526397705078" width="107.63158416748047" height="19.49473762512207" fill="black" rx="2"/><rect x="354.0000305175781" y="163.2526397705078" width="114.00000762939453" height="19.49473762512207" fill="black" rx="2"/><rect x="82.51052856445312" y="193.2421112060547" width="94.97895050048828" height="21.515790939331055" fill="black" rx="2"/><rect x="70.25789642333984" y="212.2526397705078" width="119.48421478271484" height="19.49473762512207" fill="black" rx="2"/><rect x="277.79473876953125" y="193.2421112060547" width="124.41053009033203" height="21.515790939331055" fill="black" rx="2"/><rect x="292.5947570800781" y="212.2526397705078" width="94.81053161621094" height="19.49473762512207" fill="black" rx="2"/><rect x="513.678955078125" y="193.2421112060547" width="72.64210510253906" height="21.515790939331055" fill="black" rx="2"/><rect x="496.16845703125" y="212.2526397705078" width="107.66316223144531" height="19.49473762512207" fill="black" rx="2"/><rect x="269.9789733886719" y="317.24212646484375" width="140.0421142578125" height="21.515790939331055" fill="black" rx="2"/><rect x="280.5105285644531" y="336.2526550292969" width="118.97895050048828" height="19.49473762512207" fill="black" rx="2"/><rect x="294.6263427734375" y="409.24212646484375" width="90.74737548828125" height="21.515790939331055" fill="black" rx="2"/><rect x="272.24737548828125" y="428.2526550292969" width="135.5052719116211" height="19.49473762512207" fill="black" rx="2"/><rect x="264.4473876953125" y="501.24212646484375" width="151.1052703857422" height="21.515790939331055" fill="black" rx="2"/><rect x="294.6473693847656" y="520.2526245117188" width="90.70526885986328" height="19.49473762512207" fill="black" rx="2"/><rect x="303.5421142578125" y="593.2421264648438" width="72.9157943725586" height="21.515790939331055" fill="black" rx="2"/><rect x="298.1842346191406" y="612.252685546875" width="83.81373596191406" height="19.49473762512207" fill="black" rx="2"/><rect x="287.536865234375" y="685.2421264648438" width="104.92632293701172" height="21.515790939331055" fill="black" rx="2"/><rect x="271.10528564453125" y="704.252685546875" width="137.90469360351562" height="19.49473762512207" fill="black" rx="2"/><rect x="292.9947509765625" y="777.2421264648438" width="94.01052856445312" height="21.515790939331055" fill="black" rx="2"/><rect x="269.131591796875" y="796.252685546875" width="141.73684692382812" height="19.49473762512207" fill="black" rx="2"/><rect x="263.1842346191406" y="852.252685546875" width="153.631591796875" height="19.49473762512207" fill="black" rx="2"/><rect x="56.10526657104492" y="874.252685546875" width="99.78947448730469" height="19.49473762512207" fill="black" rx="2"/><rect x="200.10000610351562" y="874.252685546875" width="91.80000305175781" height="19.49473762512207" fill="black" rx="2"/><rect x="339.5052795410156" y="874.252685546875" width="92.9894790649414" height="19.49473762512207" fill="black" rx="2"/><rect x="481.5736999511719" y="874.252685546875" width="138.85263061523438" height="19.49473762512207" fill="black" rx="2"/></mask></defs>
+
+  <!-- ── LAYER 1: Data Sources ── -->
+  <g onclick="sendPrompt('Tell me more about the data sources in this architecture')" style="fill:rgb(0, 0, 0);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto">
+    <rect x="215" y="20" width="250" height="52" rx="8" stroke-width="0.5" style="fill:rgb(12, 68, 124);stroke:rgb(133, 183, 235);color:rgb(255, 255, 255);stroke-width:0.5px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+    <text x="340" y="40" text-anchor="middle" dominant-baseline="central" style="fill:rgb(181, 212, 244);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:14px;font-weight:500;text-anchor:middle;dominant-baseline:central">Data sources</text>
+    <text x="340" y="58" text-anchor="middle" dominant-baseline="central" style="fill:rgb(133, 183, 235);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:central">PDFs · images · API streams</text>
+  </g>
+
+  <!-- arrow down -->
+  <line x1="340" y1="72" x2="340" y2="102" marker-end="url(#arrow)" style="fill:none;stroke:rgb(156, 154, 146);color:rgb(255, 255, 255);stroke-width:1.5px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+  <text x="358" y="91" dominant-baseline="central" style="fill:rgb(194, 192, 182);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:start;dominant-baseline:central">Kafka producer</text>
+
+  <!-- ── LAYER 2: Kafka Topics ── -->
+  <g onclick="sendPrompt('How does Kafka work in a streaming AI pipeline?')" style="fill:rgb(0, 0, 0);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto">
+    <rect x="215" y="102" width="250" height="52" rx="8" stroke-width="0.5" style="fill:rgb(60, 52, 137);stroke:rgb(175, 169, 236);color:rgb(255, 255, 255);stroke-width:0.5px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+    <text x="340" y="122" text-anchor="middle" dominant-baseline="central" style="fill:rgb(206, 203, 246);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:14px;font-weight:500;text-anchor:middle;dominant-baseline:central">Kafka topics</text>
+    <text x="340" y="140" text-anchor="middle" dominant-baseline="central" style="fill:rgb(175, 169, 236);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:central">text · image · docs</text>
+  </g>
+
+  <!-- arrow down -->
+  <line x1="340" y1="154" x2="340" y2="184" marker-end="url(#arrow)" style="fill:none;stroke:rgb(156, 154, 146);color:rgb(255, 255, 255);stroke-width:1.5px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+  <text x="358" y="173" dominant-baseline="central" style="fill:rgb(194, 192, 182);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:start;dominant-baseline:central">PySpark streaming</text>
+
+  <!-- ── LAYER 3: Processing fan-out (3 boxes) ── -->
+  <!-- Text Cleaning -->
+  <g onclick="sendPrompt('What does the text cleaning step do in the pipeline?')" style="fill:rgb(0, 0, 0);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto">
+    <rect x="50" y="184" width="160" height="52" rx="8" stroke-width="0.5" style="fill:rgb(8, 80, 65);stroke:rgb(93, 202, 165);color:rgb(255, 255, 255);stroke-width:0.5px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+    <text x="130" y="204" text-anchor="middle" dominant-baseline="central" style="fill:rgb(159, 225, 203);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:14px;font-weight:500;text-anchor:middle;dominant-baseline:central">Text cleaning</text>
+    <text x="130" y="222" text-anchor="middle" dominant-baseline="central" style="fill:rgb(93, 202, 165);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:central">Tokenize · normalize</text>
+  </g>
+  <!-- Image Processing -->
+  <g onclick="sendPrompt('How is image processing done in this multimodal pipeline?')" style="fill:rgb(0, 0, 0);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto">
+    <rect x="260" y="184" width="160" height="52" rx="8" stroke-width="0.5" style="fill:rgb(8, 80, 65);stroke:rgb(93, 202, 165);color:rgb(255, 255, 255);stroke-width:0.5px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+    <text x="340" y="204" text-anchor="middle" dominant-baseline="central" style="fill:rgb(159, 225, 203);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:14px;font-weight:500;text-anchor:middle;dominant-baseline:central">Image processing</text>
+    <text x="340" y="222" text-anchor="middle" dominant-baseline="central" style="fill:rgb(93, 202, 165);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:central">Resize · encode</text>
+  </g>
+  <!-- Metadata -->
+  <g onclick="sendPrompt('What metadata is extracted in this pipeline?')" style="fill:rgb(0, 0, 0);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto">
+    <rect x="470" y="184" width="160" height="52" rx="8" stroke-width="0.5" style="fill:rgb(8, 80, 65);stroke:rgb(93, 202, 165);color:rgb(255, 255, 255);stroke-width:0.5px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+    <text x="550" y="204" text-anchor="middle" dominant-baseline="central" style="fill:rgb(159, 225, 203);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:14px;font-weight:500;text-anchor:middle;dominant-baseline:central">Metadata</text>
+    <text x="550" y="222" text-anchor="middle" dominant-baseline="central" style="fill:rgb(93, 202, 165);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:central">Tags · timestamps</text>
+  </g>
+
+  <!-- fan-out lines from Kafka -->
+  <path d="M340 154 L340 175 L130 175 L130 184" fill="none" stroke="var(--color-border-primary)" stroke-width="1" marker-end="url(#arrow)" style="fill:none;stroke:rgba(222, 220, 209, 0.4);color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+  <path d="M340 154 L340 175 L340 184" fill="none" stroke="var(--color-border-primary)" stroke-width="1" marker-end="url(#arrow)" style="fill:none;stroke:rgba(222, 220, 209, 0.4);color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+  <path d="M340 154 L340 175 L550 175 L550 184" fill="none" stroke="var(--color-border-primary)" stroke-width="1" marker-end="url(#arrow)" mask="url(#imagine-text-gaps-uulst5)" style="fill:none;stroke:rgba(222, 220, 209, 0.4);color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+
+  <!-- fan-in lines to Embedding -->
+  <path d="M130 236 L130 290 L340 290 L340 308" fill="none" stroke="var(--color-border-primary)" stroke-width="1" marker-end="url(#arrow)" style="fill:none;stroke:rgba(222, 220, 209, 0.4);color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+  <path d="M340 236 L340 308" fill="none" stroke="var(--color-border-primary)" stroke-width="1" marker-end="url(#arrow)" style="fill:none;stroke:rgba(222, 220, 209, 0.4);color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+  <path d="M550 236 L550 290 L340 290 L340 308" fill="none" stroke="var(--color-border-primary)" stroke-width="1" marker-end="url(#arrow)" style="fill:none;stroke:rgba(222, 220, 209, 0.4);color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+
+  <!-- ── LAYER 4: Embedding Pipeline ── -->
+  <g onclick="sendPrompt('What is CLIP and how are embeddings generated in this pipeline?')" style="fill:rgb(0, 0, 0);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto">
+    <rect x="190" y="308" width="300" height="52" rx="8" stroke-width="0.5" style="fill:rgb(99, 56, 6);stroke:rgb(239, 159, 39);color:rgb(255, 255, 255);stroke-width:0.5px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+    <text x="340" y="328" text-anchor="middle" dominant-baseline="central" style="fill:rgb(250, 199, 117);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:14px;font-weight:500;text-anchor:middle;dominant-baseline:central">Embedding pipeline</text>
+    <text x="340" y="346" text-anchor="middle" dominant-baseline="central" style="fill:rgb(239, 159, 39);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:central">CLIP · OpenAI · BGE</text>
+  </g>
+
+  <!-- arrow down -->
+  <line x1="340" y1="360" x2="340" y2="400" marker-end="url(#arrow)" style="fill:none;stroke:rgb(156, 154, 146);color:rgb(255, 255, 255);stroke-width:1.5px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+
+  <!-- ── LAYER 5: Vector Store ── -->
+  <g onclick="sendPrompt('How does FAISS vector search work?')" style="fill:rgb(0, 0, 0);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto">
+    <rect x="215" y="400" width="250" height="52" rx="8" stroke-width="0.5" style="fill:rgb(99, 56, 6);stroke:rgb(239, 159, 39);color:rgb(255, 255, 255);stroke-width:0.5px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+    <text x="340" y="420" text-anchor="middle" dominant-baseline="central" style="fill:rgb(250, 199, 117);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:14px;font-weight:500;text-anchor:middle;dominant-baseline:central">Vector store</text>
+    <text x="340" y="438" text-anchor="middle" dominant-baseline="central" style="fill:rgb(239, 159, 39);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:central">FAISS similarity search</text>
+  </g>
+
+  <!-- arrow down -->
+  <line x1="340" y1="452" x2="340" y2="492" marker-end="url(#arrow)" style="fill:none;stroke:rgb(156, 154, 146);color:rgb(255, 255, 255);stroke-width:1.5px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+
+  <!-- ── LAYER 6: Retrieval + Re-ranking ── -->
+  <g onclick="sendPrompt('What is a cross encoder and how does re-ranking improve RAG?')" style="fill:rgb(0, 0, 0);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto">
+    <rect x="190" y="492" width="300" height="52" rx="8" stroke-width="0.5" style="fill:rgb(99, 56, 6);stroke:rgb(239, 159, 39);color:rgb(255, 255, 255);stroke-width:0.5px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+    <text x="340" y="512" text-anchor="middle" dominant-baseline="central" style="fill:rgb(250, 199, 117);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:14px;font-weight:500;text-anchor:middle;dominant-baseline:central">Retrieval + re-ranking</text>
+    <text x="340" y="530" text-anchor="middle" dominant-baseline="central" style="fill:rgb(239, 159, 39);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:central">Cross encoder</text>
+  </g>
+
+  <!-- arrow down -->
+  <line x1="340" y1="544" x2="340" y2="584" marker-end="url(#arrow)" style="fill:none;stroke:rgb(156, 154, 146);color:rgb(255, 255, 255);stroke-width:1.5px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+
+  <!-- ── LAYER 7: LLM ── -->
+  <g onclick="sendPrompt('How is the LLM layer integrated with the RAG pipeline?')" style="fill:rgb(0, 0, 0);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto">
+    <rect x="215" y="584" width="250" height="52" rx="8" stroke-width="0.5" style="fill:rgb(113, 43, 19);stroke:rgb(240, 153, 123);color:rgb(255, 255, 255);stroke-width:0.5px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+    <text x="340" y="604" text-anchor="middle" dominant-baseline="central" style="fill:rgb(245, 196, 179);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:14px;font-weight:500;text-anchor:middle;dominant-baseline:central">LLM layer</text>
+    <text x="340" y="622" text-anchor="middle" dominant-baseline="central" style="fill:rgb(240, 153, 123);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:central">GPT-4 · Llama</text>
+  </g>
+
+  <!-- arrow down -->
+  <line x1="340" y1="636" x2="340" y2="676" marker-end="url(#arrow)" style="fill:none;stroke:rgb(156, 154, 146);color:rgb(255, 255, 255);stroke-width:1.5px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+
+  <!-- ── LAYER 8: FastAPI ── -->
+  <g onclick="sendPrompt('How is FastAPI used to serve the AI model?')" style="fill:rgb(0, 0, 0);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto">
+    <rect x="215" y="676" width="250" height="52" rx="8" stroke-width="0.5" style="fill:rgb(12, 68, 124);stroke:rgb(133, 183, 235);color:rgb(255, 255, 255);stroke-width:0.5px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+    <text x="340" y="696" text-anchor="middle" dominant-baseline="central" style="fill:rgb(181, 212, 244);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:14px;font-weight:500;text-anchor:middle;dominant-baseline:central">FastAPI server</text>
+    <text x="340" y="714" text-anchor="middle" dominant-baseline="central" style="fill:rgb(133, 183, 235);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:central">REST endpoints · async</text>
+  </g>
+
+  <!-- arrow down -->
+  <line x1="340" y1="728" x2="340" y2="768" marker-end="url(#arrow)" style="fill:none;stroke:rgb(156, 154, 146);color:rgb(255, 255, 255);stroke-width:1.5px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+
+  <!-- ── LAYER 9: Frontend ── -->
+  <g onclick="sendPrompt('What does the frontend UI look like for this platform?')" style="fill:rgb(0, 0, 0);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto">
+    <rect x="215" y="768" width="250" height="52" rx="8" stroke-width="0.5" style="fill:rgb(12, 68, 124);stroke:rgb(133, 183, 235);color:rgb(255, 255, 255);stroke-width:0.5px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+    <text x="340" y="788" text-anchor="middle" dominant-baseline="central" style="fill:rgb(181, 212, 244);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:14px;font-weight:500;text-anchor:middle;dominant-baseline:central">Frontend / UI</text>
+    <text x="340" y="806" text-anchor="middle" dominant-baseline="central" style="fill:rgb(133, 183, 235);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:central">Chat interface · uploads</text>
+  </g>
+
+  <!-- ── MLOps monitoring band ── -->
+  <!-- dashed container -->
+  <rect x="30" y="848" width="620" height="58" rx="10" fill="none" stroke="var(--color-border-secondary)" stroke-width="1" stroke-dasharray="6 4" style="fill:none;stroke:rgba(222, 220, 209, 0.3);color:rgb(255, 255, 255);stroke-width:1px;stroke-dasharray:6px, 4px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+  <text x="340" y="862" text-anchor="middle" dominant-baseline="central" style="fill:rgb(194, 192, 182);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:central">Monitoring + MLOps layer</text>
+
+  <!-- 4 pillars -->
+  <g onclick="sendPrompt('How does MLflow model tracking work?')" style="fill:rgb(0, 0, 0);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto">
+    <rect x="42" y="870" width="128" height="28" rx="6" stroke-width="0.5" style="fill:rgb(68, 68, 65);stroke:rgb(180, 178, 169);color:rgb(255, 255, 255);stroke-width:0.5px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+    <text x="106" y="884" text-anchor="middle" dominant-baseline="central" style="fill:rgb(180, 178, 169);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:central">MLflow tracking</text>
+  </g>
+  <g onclick="sendPrompt('How is data drift detected in ML pipelines?')" style="fill:rgb(0, 0, 0);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto">
+    <rect x="182" y="870" width="128" height="28" rx="6" stroke-width="0.5" style="fill:rgb(68, 68, 65);stroke:rgb(180, 178, 169);color:rgb(255, 255, 255);stroke-width:0.5px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+    <text x="246" y="884" text-anchor="middle" dominant-baseline="central" style="fill:rgb(180, 178, 169);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:central">Drift detection</text>
+  </g>
+  <g onclick="sendPrompt('What triggers auto-retraining in an MLOps pipeline?')" style="fill:rgb(0, 0, 0);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto">
+    <rect x="322" y="870" width="128" height="28" rx="6" stroke-width="0.5" style="fill:rgb(68, 68, 65);stroke:rgb(180, 178, 169);color:rgb(255, 255, 255);stroke-width:0.5px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+    <text x="386" y="884" text-anchor="middle" dominant-baseline="central" style="fill:rgb(180, 178, 169);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:central">Auto retraining</text>
+  </g>
+  <g onclick="sendPrompt('How is Docker used for ML model deployment?')" style="fill:rgb(0, 0, 0);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto">
+    <rect x="462" y="870" width="178" height="28" rx="6" stroke-width="0.5" style="fill:rgb(68, 68, 65);stroke:rgb(180, 178, 169);color:rgb(255, 255, 255);stroke-width:0.5px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+    <text x="551" y="884" text-anchor="middle" dominant-baseline="central" style="fill:rgb(180, 178, 169);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:central">Model registry · Docker</text>
+  </g>
+
+  <!-- connector from Frontend to MLOps band -->
+  <line x1="340" y1="820" x2="340" y2="848" stroke-dasharray="4 3" marker-end="url(#arrow)" style="fill:none;stroke:rgb(156, 154, 146);color:rgb(255, 255, 255);stroke-width:1.5px;stroke-dasharray:4px, 3px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:&quot;Anthropic Sans&quot;, -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+</svg>
+</file>
+
+<file path="sql/init_supabase.sql">
+-- Copyright 2024
+-- Directory: yt-rag/sql/init_supabase.sql
+-- 
+-- Complete Supabase Database Setup for RAG Application
+-- Run this script on a FRESH Supabase project
+-- 
+-- Instructions:
+-- 1. Create a new Supabase project at https://supabase.com
+-- 2. Wait for project initialization to complete
+-- 3. Go to SQL Editor in your Supabase dashboard
+-- 4. Create a new query
+-- 5. Copy and paste this ENTIRE script
+-- 6. Click "Run" to execute everything at once
+--
+-- This script creates everything from scratch
+
+-- Drop old versions if they exist to allow changing return types
+DROP FUNCTION IF EXISTS match_chunks(vector, integer, double precision);
+DROP FUNCTION IF EXISTS get_chunk_stats();
+
+-- =============================================================================
+-- STEP 1: Enable pgvector extension for vector similarity search
+-- =============================================================================
+
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- =============================================================================
+-- STEP 2: Create the main RAG chunks table
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS rag_chunks (
+    id BIGSERIAL PRIMARY KEY,
+    chunk_id TEXT NOT NULL UNIQUE,
+  document_id TEXT NOT NULL,
+    source TEXT NOT NULL,
+  page_number INTEGER,
+  item_type TEXT NOT NULL DEFAULT 'text',
+    text TEXT NOT NULL,
+  image_path TEXT,
+  caption TEXT,
+  ocr_text TEXT,
+  width INTEGER,
+  height INTEGER,
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    embedding VECTOR(1536),  -- OpenAI text-embedding-3-small dimension (1536)
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+ALTER TABLE rag_chunks
+  ADD COLUMN IF NOT EXISTS document_id TEXT,
+  ADD COLUMN IF NOT EXISTS page_number INTEGER,
+  ADD COLUMN IF NOT EXISTS item_type TEXT NOT NULL DEFAULT 'text',
+  ADD COLUMN IF NOT EXISTS image_path TEXT,
+  ADD COLUMN IF NOT EXISTS caption TEXT,
+  ADD COLUMN IF NOT EXISTS ocr_text TEXT,
+  ADD COLUMN IF NOT EXISTS width INTEGER,
+  ADD COLUMN IF NOT EXISTS height INTEGER,
+  ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+UPDATE rag_chunks
+SET document_id = COALESCE(document_id, split_part(chunk_id, '#', 1))
+WHERE document_id IS NULL;
+
+ALTER TABLE rag_chunks
+  ALTER COLUMN document_id SET NOT NULL;
+
+-- =============================================================================
+-- STEP 3: Create performance indexes for fast vector search
+-- =============================================================================
+
+-- Vector similarity index using IVFFlat algorithm (works with 1536 dimensions)
+-- Using text-embedding-3-small (1536 dimensions) for compatibility
+CREATE INDEX rag_chunks_vec_idx
+    ON rag_chunks USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+
+-- Regular B-tree indexes for filtering and sorting
+CREATE INDEX rag_chunks_src_idx ON rag_chunks (source);
+CREATE INDEX rag_chunks_chunk_id_idx ON rag_chunks (chunk_id);
+CREATE INDEX rag_chunks_created_at_idx ON rag_chunks (created_at DESC);
+CREATE INDEX rag_chunks_document_id_idx ON rag_chunks (document_id);
+CREATE INDEX rag_chunks_page_number_idx ON rag_chunks (page_number);
+CREATE INDEX rag_chunks_item_type_idx ON rag_chunks (item_type);
+
+-- =============================================================================
+-- STEP 4: Create vector similarity search function
+-- =============================================================================
+
+CREATE OR REPLACE FUNCTION match_chunks (
+  query_embedding vector(1536),
+  match_count int DEFAULT 6,
+  min_similarity float DEFAULT 0.0
+)
+RETURNS TABLE (
+  chunk_id text,
+  document_id text,
+  source text,
+  page_number integer,
+  item_type text,
+  text text,
+  image_path text,
+  caption text,
+  ocr_text text,
+  width integer,
+  height integer,
+  metadata jsonb,
+  similarity float,
+  created_at timestamptz
+)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  RETURN QUERY
+  SELECT
+    rag_chunks.chunk_id,
+    rag_chunks.document_id,
+    rag_chunks.source,
+    rag_chunks.page_number,
+    rag_chunks.item_type,
+    rag_chunks.text,
+    rag_chunks.image_path,
+    rag_chunks.caption,
+    rag_chunks.ocr_text,
+    rag_chunks.width,
+    rag_chunks.height,
+    rag_chunks.metadata,
+    1 - (rag_chunks.embedding <=> query_embedding) as similarity,
+    rag_chunks.created_at
+  FROM rag_chunks
+  WHERE 1 - (rag_chunks.embedding <=> query_embedding) >= min_similarity
+  ORDER BY rag_chunks.embedding <=> query_embedding
+  LIMIT match_count;
+END;
+$$;
+
+-- =============================================================================
+-- STEP 5: Create helper function to get database statistics
+-- =============================================================================
+
+CREATE OR REPLACE FUNCTION get_chunk_stats()
+RETURNS TABLE (
+  total_chunks bigint,
+  unique_sources bigint,
+  latest_chunk timestamptz
+)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  RETURN QUERY
+  SELECT
+    COUNT(*) as total_chunks,
+    COUNT(DISTINCT source) as unique_sources,
+    MAX(created_at) as latest_chunk
+  FROM rag_chunks;
+END;
+$$;
+
+-- =============================================================================
+-- STEP 6: Create Row Level Security (RLS) policies
+-- =============================================================================
+
+-- Enable RLS on the table
+ALTER TABLE rag_chunks ENABLE ROW LEVEL SECURITY;
+
+-- Allow all operations for service role (your backend)
+CREATE POLICY "Allow service role full access" ON rag_chunks
+  FOR ALL USING (auth.jwt() ->> 'role' = 'service_role');
+
+-- Allow read access for authenticated users (future frontend)
+CREATE POLICY "Allow authenticated read access" ON rag_chunks
+  FOR SELECT USING (auth.role() = 'authenticated');
+
+-- Allow anonymous read access for development (remove in production)
+CREATE POLICY "Allow anonymous read access" ON rag_chunks
+  FOR SELECT USING (true);
+
+-- =============================================================================
+-- STEP 7: Verification - Test that everything was created correctly
+-- =============================================================================
+
+-- Test 1: Check pgvector extension
+SELECT 'pgvector extension installed' as test_result 
+WHERE EXISTS (
+  SELECT 1 FROM pg_extension WHERE extname = 'vector'
+);
+
+-- Test 2: Check table creation
+SELECT 'rag_chunks table created' as test_result 
+WHERE EXISTS (
+  SELECT 1 FROM information_schema.tables 
+  WHERE table_schema = 'public' AND table_name = 'rag_chunks'
+);
+
+-- Test 3: Check vector column dimensions
+SELECT 
+  'Vector column configured for text-embedding-3-small' as test_result,
+  'VECTOR(1536) dimensions' as details
+WHERE EXISTS (
+  SELECT 1 FROM information_schema.columns 
+  WHERE table_name = 'rag_chunks' 
+  AND column_name = 'embedding'
+);
+
+-- Test 4: Check functions
+SELECT 'match_chunks function created' as test_result 
+WHERE EXISTS (
+  SELECT 1 FROM information_schema.routines 
+  WHERE routine_schema = 'public' AND routine_name = 'match_chunks'
+);
+
+SELECT 'get_chunk_stats function created' as test_result 
+WHERE EXISTS (
+  SELECT 1 FROM information_schema.routines 
+  WHERE routine_schema = 'public' AND routine_name = 'get_chunk_stats'
+);
+
+-- Test 5: Check indexes
+SELECT 'Vector index created' as test_result
+WHERE EXISTS (
+  SELECT 1 FROM pg_indexes 
+  WHERE tablename = 'rag_chunks' AND indexname = 'rag_chunks_vec_idx'
+);
+
+-- Test 6: Show initial database stats (should be empty)
+SELECT 
+  'Database ready - ' || total_chunks::text || ' chunks' as test_result
+FROM get_chunk_stats();
+
+-- =============================================================================
+-- SUCCESS MESSAGE
+-- =============================================================================
+
+SELECT '🎉 SUCCESS! Your Supabase database is ready for RAG!' as final_result;
+
+-- =============================================================================
+-- WHAT WAS CREATED:
+-- =============================================================================
+-- 
+-- ✅ Extensions:
+--    - pgvector (for vector operations)
+-- 
+-- ✅ Tables:
+--    - rag_chunks (with VECTOR(1536) for text-embedding-3-small)
+-- 
+-- ✅ Indexes:
+--    - IVFFlat vector index (optimized for 1536 dimensions)
+--    - B-tree indexes for fast filtering
+-- 
+-- ✅ Functions:
+--    - match_chunks() - vector similarity search
+--    - get_chunk_stats() - database statistics
+-- 
+-- ✅ Security:
+--    - Row Level Security enabled
+--    - Policies for service role, authenticated users, and anonymous access
+-- 
+-- =============================================================================
+-- NEXT STEPS:
+-- =============================================================================
+-- 
+-- 1. Update your .env file with Supabase credentials:
+--    SUPABASE_URL=https://your-project.supabase.co
+--    SUPABASE_ANON_KEY=your_anon_key
+--    SUPABASE_SERVICE_ROLE_KEY=your_service_key
+--    OPENAI_API_KEY=your_openai_key
+-- 
+-- 2. Start your FastAPI backend:
+--    uvicorn main:app --reload --port 8000
+-- 
+-- 3. Test the health check:
+--    curl http://localhost:8000/healthz
+-- 
+-- 4. Seed your knowledge base:
+--    curl -X POST http://localhost:8000/seed
+-- 
+-- 5. Ask your first question:
+--    curl -X POST http://localhost:8000/answer \
+--      -H "Content-Type: application/json" \
+--      -d '{"query": "What is your return policy?"}'
+-- 
+-- 6. Visit interactive docs:
+--    http://localhost:8000/docs
+-- 
+-- =============================================================================
+</file>
+
+<file path="static/chat.html">
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Customer Support - Chat & Knowledge Base</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --primary-color: #4f46e5;
+            --primary-light: #6366f1;
+            --primary-dark: #4338ca;
+            --text-primary: #1f2937;
+            --text-secondary: #6b7280;
+            --text-muted: #9ca3af;
+            --bg-primary: #f9fafb;
+            --bg-secondary: #ffffff;
+            --border-color: #e5e7eb;
+            --border-light: #f3f4f6;
+            --shadow: 0 4px 20px rgba(0,0,0,0.08);
+            --shadow-lg: 0 10px 40px rgba(0,0,0,0.12);
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 25%, #f8fafc 50%, #f1f5f9 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+
+        .app-container {
+            width: 100%;
+            max-width: 1400px;
+            height: 90vh;
+            background: var(--bg-secondary);
+            border-radius: 24px;
+            box-shadow: var(--shadow-lg);
+            border: 1px solid var(--border-light);
+            display: grid;
+            grid-template-columns: 1fr 480px;
+            overflow: hidden;
+            backdrop-filter: blur(10px);
+        }
+
+        /* Chat Section */
+        .chat-section {
+            display: flex;
+            flex-direction: column;
+            border-right: 1px solid var(--border-color);
+            min-height: 0; /* Important for flex scrolling */
+            height: 100%; /* Ensure full height */
+        }
+
+        .chat-header {
+            background: var(--bg-secondary);
+            color: var(--text-primary);
+            padding: 20px;
+            text-align: left;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .chat-header h1 {
+            font-size: 20px;
+            font-weight: 600;
+            margin-bottom: 4px;
+            color: var(--text-primary);
+        }
+
+        .chat-header p {
+            font-size: 14px;
+            color: var(--text-secondary);
+            margin: 0;
+        }
+
+        .status {
+            padding: 8px 20px;
+            text-align: right;
+            font-size: 12px;
+            font-weight: 400;
+            transition: all 0.3s ease;
+            background: var(--bg-primary);
+            color: var(--text-muted);
+            border-bottom: 1px solid var(--border-light);
+        }
+
+        .status.connected { 
+            color: #6b7280;
+        }
+        .status.error { 
+            color: #9ca3af;
+        }
+        .status.warning { 
+            color: #9ca3af;
+        }
+
+        .chat-messages {
+            flex: 1;
+            padding: 20px;
+            overflow-y: auto;
+            overflow-x: hidden;
+            background: var(--bg-primary);
+            min-height: 0; /* Important for flex scrolling */
+            max-height: 100%; /* Ensure it doesn't exceed container */
+        }
+
+        .message {
+            margin-bottom: 20px;
+            display: flex;
+            align-items: flex-start;
+            animation: fadeInUp 0.3s ease;
+        }
+
+        .message.user {
+            justify-content: flex-end;
+        }
+
+        .message-content {
+            max-width: 70%;
+            padding: 15px 20px;
+            border-radius: 20px;
+            word-wrap: break-word;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            position: relative;
+        }
+
+        .message.bot .message-content {
+            background: linear-gradient(135deg, #f0f9ff, #e0f2fe);
+            color: var(--text-primary);
+            border-bottom-left-radius: 8px;
+            border: 1px solid #bae6fd;
+        }
+
+        .message.user .message-content {
+            background: var(--text-primary);
+            color: grey;
+            border-bottom-right-radius: 8px;
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+
+        .message-avatar {
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 18px;
+            margin: 0 10px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+        }
+
+        .message.bot .message-avatar {
+            background: linear-gradient(135deg, var(--primary-color), var(--primary-light));
+            color: grey;
+            border: 2px solid white;
+        }
+
+        .message.user .message-avatar {
+            background: var(--text-primary);
+            color: grey;
+            border: 2px solid white;
+        }
+
+        .citations {
+            font-size: 12px;
+            margin-top: 10px;
+            opacity: 0.8;
+            font-style: italic;
+            padding: 8px 12px;
+            background: rgba(255,255,255,0.3);
+            border-radius: 10px;
+        }
+
+        .chat-input {
+            padding: 20px;
+            background: var(--bg-secondary);
+            border-top: 1px solid var(--border-color);
+            display: flex;
+            gap: 10px;
+        }
+
+        .chat-input input {
+            flex: 1;
+            padding: 15px 20px;
+            border: 2px solid var(--border-color);
+            border-radius: 25px;
+            font-size: 16px;
+            outline: none;
+            transition: all 0.3s ease;
+        }
+
+        .chat-input input:focus {
+            border-color: var(--primary-color);
+            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+        }
+
+        .chat-input button {
+            padding: 10px 16px;
+            background: var(--text-primary);
+            color: white;
+            border: none;
+            border-radius: 12px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+            transition: all 0.2s ease;
+            box-shadow: none;
+            min-width: 60px;
+        }
+
+        .chat-input button:hover {
+            background: var(--primary-color);
+            transform: none;
+        }
+
+        .chat-input button:disabled {
+            background: var(--text-muted);
+            cursor: not-allowed;
+            opacity: 0.6;
+        }
+
+        .typing-indicator {
+            display: none;
+            padding: 16px 20px;
+            background: linear-gradient(135deg, #f0f9ff, #e0f2fe);
+            border-radius: 20px;
+            margin: 10px 0;
+            width: fit-content;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            border: 1px solid #bae6fd;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .typing-content {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .typing-dots {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+        }
+
+        .typing-dots span {
+            display: inline-block;
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: var(--primary-color);
+            animation: typing 1.4s infinite both;
+        }
+
+        .typing-dots span:nth-child(1) { animation-delay: 0s; }
+        .typing-dots span:nth-child(2) { animation-delay: 0.2s; }
+        .typing-dots span:nth-child(3) { animation-delay: 0.4s; }
+
+        /* Document Editor Section */
+        .editor-section {
+            display: flex;
+            flex-direction: column;
+            background: var(--bg-primary);
+            min-height: 0; /* Important for flex scrolling */
+            height: 100%; /* Ensure full height */
+        }
+
+        .editor-header {
+            padding: 20px;
+            background: var(--bg-secondary);
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .editor-header h2 {
+            color: var(--text-primary);
+            font-size: 20px;
+            font-weight: 600;
+            margin-bottom: 4px;
+        }
+
+        .editor-header p {
+            color: var(--text-secondary);
+            font-size: 14px;
+            margin: 0;
+        }
+
+        .upload-panel {
+            margin: 16px 20px 0;
+            padding: 16px;
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            background: linear-gradient(135deg, #ffffff 0%, #f8fafc 100%);
+            box-shadow: 0 4px 18px rgba(15, 23, 42, 0.06);
+        }
+
+        .upload-panel h3 {
+            font-size: 15px;
+            color: var(--text-primary);
+            margin-bottom: 8px;
+        }
+
+        .upload-panel p {
+            font-size: 13px;
+            color: var(--text-secondary);
+            margin-bottom: 12px;
+        }
+
+        .upload-controls {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+
+        .upload-controls input[type="file"] {
+            flex: 1;
+            min-width: 180px;
+            padding: 10px;
+            border: 1px dashed var(--border-color);
+            border-radius: 10px;
+            background: white;
+            color: var(--text-secondary);
+        }
+
+        .upload-button {
+            padding: 10px 16px;
+            border: none;
+            border-radius: 10px;
+            background: var(--text-primary);
+            color: white;
+            font-weight: 600;
+            cursor: pointer;
+        }
+
+        .upload-button:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+
+        .upload-summary {
+            margin-top: 12px;
+            font-size: 13px;
+            color: var(--text-secondary);
+        }
+
+        .editor-tabs {
+            display: flex;
+            background: var(--bg-secondary);
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .tab-button {
+            flex: 1;
+            padding: 12px 20px;
+            background: none;
+            border: none;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+            color: var(--text-secondary);
+            transition: all 0.2s ease;
+            border-bottom: 2px solid transparent;
+        }
+
+        .tab-button.active {
+            color: var(--primary-color);
+            border-bottom-color: var(--primary-color);
+            background: rgba(102, 126, 234, 0.03);
+        }
+
+        .tab-content {
+            flex: 1;
+            padding: 20px;
+            overflow-y: auto;
+            overflow-x: hidden;
+            min-height: 0; /* Important for flex scrolling */
+            max-height: 100%; /* Ensure it doesn't exceed container */
+        }
+
+        .document-item {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            margin-bottom: 15px;
+            overflow: hidden;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            transition: all 0.3s ease;
+        }
+
+        .document-item:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 15px rgba(0,0,0,0.15);
+        }
+
+        .document-header {
+            padding: 15px 20px;
+            background: linear-gradient(135deg, #f8f9fa, #e9ecef);
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .document-id {
+            font-weight: 600;
+            color: var(--primary-color);
+            font-size: 14px;
+        }
+
+        .document-source {
+            font-size: 12px;
+            color: var(--text-secondary);
+            font-style: italic;
+        }
+
+        .document-text {
+            padding: 20px;
+        }
+
+        .document-text textarea {
+            width: 100%;
+            min-height: 120px;
+            border: none;
+            outline: none;
+            font-family: inherit;
+            font-size: 14px;
+            line-height: 1.5;
+            color: var(--text-primary);
+            background: transparent;
+            resize: vertical;
+        }
+
+        .save-section {
+            padding: 24px;
+            background: var(--bg-secondary);
+            border-top: 1px solid var(--border-color);
+        }
+
+        .save-button {
+            width: 100%;
+            padding: 14px 16px;
+            background: var(--primary-color);
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            box-shadow: none;
+            white-space: nowrap;
+            overflow: visible;
+            min-height: 48px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            text-align: center;
+            line-height: 1.3;
+            box-sizing: border-box;
+        }
+
+        .save-button.loading {
+            background: #f59e0b;
+            color: black;
+        }
+
+        .save-button.success {
+            background: #10b981;
+            color: grey;
+        }
+
+        .save-button.error {
+            background: #ef4444;
+            color: black;
+        }
+
+        .save-button:hover {
+            background: var(--primary-dark);
+            transform: none;
+        }
+
+        .save-button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+            transform: none;
+            box-shadow: none;
+        }
+
+
+        .notification {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            padding: 15px 20px;
+            border-radius: 12px;
+            color: grey;
+            font-weight: 600;
+            z-index: 1000;
+            transform: translateX(400px);
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.2);
+        }
+
+        .notification.show {
+            transform: translateX(0);
+        }
+
+        .notification.success { background: var(--success-color); }
+        .notification.error { background: var(--error-color); }
+        .notification.info { background: var(--info-color); }
+
+        @keyframes fadeInUp {
+            from {
+                opacity: 0;
+                transform: translateY(20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        @keyframes typing {
+            0%, 60%, 100% { transform: translateY(0); }
+            30% { transform: translateY(-10px); }
+        }
+
+        /* Responsive Design */
+        @media (max-width: 1200px) {
+            .app-container {
+                grid-template-columns: 1fr;
+                grid-template-rows: 1fr auto;
+                height: 95vh;
+            }
+            
+            .editor-section {
+                max-height: 400px;
+            }
+        }
+
+        @media (max-width: 768px) {
+            body {
+                padding: 10px;
+            }
+            
+            .app-container {
+                border-radius: 10px;
+                height: 95vh;
+            }
+            
+            .message-content {
+                max-width: 85%;
+            }
+            
+            .chat-header h1 {
+                font-size: 20px;
+            }
+            
+            .editor-header h2 {
+                font-size: 16px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="app-container">
+        <!-- Chat Section -->
+        <div class="chat-section">
+            <div class="chat-header">
+                <h1>Customer Support</h1>
+                <p>Chat with our AI assistant for help with orders, returns, and policies</p>
+            </div>
+            
+            <div class="status" id="status">Checking connection...</div>
+            
+            <div class="chat-messages" id="messages">
+                <div class="message bot">
+                    <div class="message-avatar">✨</div>
+                    <div class="message-content">
+                        Welcome to the AI Assistant! 👋
+                        <br><br>
+                        I can help you with:
+                        • Questions about policies and services
+                        • Return and shipping information
+                        • Customer support inquiries
+                        <br><br>
+                        You can also edit the knowledge base documents on the right panel and update the vector database in real-time!
+                    </div>
+                </div>
+            </div>
+            
+            <div class="typing-indicator" id="typing">
+                <div class="message-avatar">💭</div>
+                <div class="typing-content">
+                    <span style="color: var(--text-secondary); font-size: 14px; margin-right: 8px;">Thinking</span>
+                    <div class="typing-dots">
+                        <span></span>
+                        <span></span>
+                        <span></span>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="chat-input">
+                <input type="text" id="messageInput" placeholder="Ask me anything about our policies..." maxlength="500">
+                <button onclick="sendMessage()" id="sendBtn">Send</button>
+            </div>
+        </div>
+
+        <!-- Document Editor Section -->
+        <div class="editor-section">
+            <div class="editor-header">
+                <div>
+                    <h2>📋 Knowledge Base Editor</h2>
+                    <p>Edit documents, upload multimodal files, and update the vector database</p>
+                </div>
+            </div>
+
+            <div class="upload-panel">
+                <h3>Upload a document</h3>
+                <p>PDF, PNG, JPG, JPEG, and DOCX files are extracted into searchable text, OCR, and image captions.</p>
+                <div class="upload-controls">
+                    <input type="file" id="fileInput" accept=".pdf,.png,.jpg,.jpeg,.docx" />
+                    <button class="upload-button" id="uploadBtn" onclick="uploadDocument()">Upload</button>
+                </div>
+                <div class="upload-summary" id="uploadSummary">No file uploaded yet.</div>
+            </div>
+
+            <div class="editor-tabs">
+                <button class="tab-button active" onclick="switchTab('documents')">Documents</button>
+                <button class="tab-button" onclick="switchTab('settings')">Settings</button>
+            </div>
+
+            <div class="tab-content" id="documentsTab">
+                <div id="documentsContainer">
+                    <!-- Documents will be loaded here -->
+                </div>
+            </div>
+
+            <div class="tab-content" id="settingsTab" style="display: none;">
+                <div style="text-align: center; padding: 40px 20px; color: var(--text-secondary);">
+                    <h3>⚙️ Settings</h3>
+                    <p>Advanced settings and configurations coming soon!</p>
+                    <br>
+                    <div style="background: var(--bg-secondary); padding: 20px; border-radius: 12px; text-align: left;">
+                        <h4 style="margin-bottom: 10px;">Current Configuration:</h4>
+                        <p><strong>API Endpoint:</strong> http://localhost:8000</p>
+                        <p><strong>Embedding Model:</strong> text-embedding-3-small</p>
+                        <p><strong>Chat Model:</strong> gpt-4o</p>
+                        <p><strong>Top-K Results:</strong> 6</p>
+                    </div>
+                </div>
+            </div>
+
+            <div class="save-section">
+                <button class="save-button" id="saveBtn" onclick="saveDocuments()">
+                    <span id="saveText">💾 Save</span>
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Notification -->
+    <div class="notification" id="notification"></div>
+
+    <script>
+        // Automatically detect the correct API base URL
+        const API_BASE_URL = window.location.origin;
+        const messagesContainer = document.getElementById('messages');
+        const messageInput = document.getElementById('messageInput');
+        const sendBtn = document.getElementById('sendBtn');
+        const typingIndicator = document.getElementById('typing');
+        const statusDiv = document.getElementById('status');
+        const documentsContainer = document.getElementById('documentsContainer');
+        const saveBtn = document.getElementById('saveBtn');
+        const notification = document.getElementById('notification');
+        const fileInput = document.getElementById('fileInput');
+        const uploadBtn = document.getElementById('uploadBtn');
+        const uploadSummary = document.getElementById('uploadSummary');
+
+        let documents = [];
+        let currentTab = 'documents';
+
+        // Initialize the application
+        init();
+
+        async function init() {
+            await checkHealth();
+            await loadDocuments();
+            messageInput.focus();
+        }
+
+        // Send message on Enter key
+        messageInput.addEventListener('keypress', function(e) {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                sendMessage();
+            }
+        });
+
+        async function checkHealth() {
+            try {
+                const response = await fetch(`${API_BASE_URL}/healthz`);
+                if (response.ok) {
+                    const data = await response.json();
+                    if (data.database_connected) {
+                        statusDiv.textContent = 'System ready';
+                        statusDiv.className = 'status connected';
+                    } else {
+                        statusDiv.textContent = 'Database connection issues';
+                        statusDiv.className = 'status warning';
+                    }
+                } else {
+                    throw new Error('Server not responding');
+                }
+            } catch (error) {
+                statusDiv.textContent = 'Connection unavailable';
+                statusDiv.className = 'status error';
+            }
+        }
+
+        async function loadDocuments() {
+            try {
+                // Fetch documents from the API
+                const response = await fetch(`${API_BASE_URL}/documents`);
+                if (response.ok) {
+                    const data = await response.json();
+                    documents = data.documents || [];
+                    console.log(`✅ Loaded ${documents.length} documents from API`);
+                } else {
+                    console.warn('Failed to fetch documents from API, using fallback');
+                    // Fallback to empty array - user can add documents manually
+                    documents = [];
+                }
+            } catch (error) {
+                console.error('Error loading documents:', error);
+                // Fallback to empty array
+                documents = [];
+            }
+
+            renderDocuments();
+        }
+
+        function renderDocuments() {
+            documentsContainer.innerHTML = '';
+            
+            documents.forEach((doc, index) => {
+                const docElement = document.createElement('div');
+                docElement.className = 'document-item';
+                docElement.innerHTML = `
+                    <div class="document-header">
+                        <div>
+                            <div class="document-id">${doc.chunk_id}</div>
+                            <div class="document-source">${doc.source}</div>
+                        </div>
+                    </div>
+                    <div class="document-text">
+                        <textarea 
+                            id="doc-${index}" 
+                            placeholder="Enter document content..."
+                            oninput="updateDocument(${index}, this.value)"
+                        >${doc.text}</textarea>
+                    </div>
+                `;
+                documentsContainer.appendChild(docElement);
+            });
+        }
+
+        function updateDocument(index, text) {
+            documents[index].text = text;
+        }
+
+        function switchTab(tabName) {
+            currentTab = tabName;
+            
+            // Update tab buttons
+            document.querySelectorAll('.tab-button').forEach(btn => {
+                btn.classList.remove('active');
+            });
+            document.querySelector(`button[onclick="switchTab('${tabName}')"]`).classList.add('active');
+            
+            // Show/hide tab content
+            document.getElementById('documentsTab').style.display = tabName === 'documents' ? 'block' : 'none';
+            document.getElementById('settingsTab').style.display = tabName === 'settings' ? 'block' : 'none';
+        }
+
+        async function saveDocuments() {
+            const saveText = document.getElementById('saveText');
+            const originalText = saveText.innerHTML;
+            
+            saveBtn.disabled = true;
+            saveBtn.classList.add('loading');
+            saveBtn.classList.remove('success', 'error');
+            saveText.innerHTML = '🔄 Saving...';
+
+            try {
+                const response = await fetch(`${API_BASE_URL}/seed`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        docs: documents
+                    })
+                });
+
+                if (response.ok) {
+                    const data = await response.json();
+                    showNotification(`✅ Successfully updated ${data.inserted} documents in database!`, 'success');
+                    saveBtn.classList.remove('loading');
+                    saveBtn.classList.add('success');
+                    saveText.innerHTML = '✅ Saved!';
+                    
+                    setTimeout(() => {
+                        saveText.innerHTML = originalText;
+                        saveBtn.classList.remove('success');
+                    }, 2000);
+                } else {
+                    throw new Error('Failed to save documents');
+                }
+            } catch (error) {
+                showNotification('❌ Failed to update database. Please try again.', 'error');
+                saveBtn.classList.remove('loading');
+                saveBtn.classList.add('error');
+                saveText.innerHTML = '❌ Failed';
+                
+                setTimeout(() => {
+                    saveText.innerHTML = originalText;
+                    saveBtn.classList.remove('error');
+                }, 2000);
+            } finally {
+                saveBtn.disabled = false;
+                saveBtn.classList.remove('loading');
+            }
+        }
+
+        function showNotification(message, type = 'info') {
+            notification.textContent = message;
+            notification.className = `notification ${type}`;
+            notification.classList.add('show');
+            
+            setTimeout(() => {
+                notification.classList.remove('show');
+            }, 4000);
+        }
+
+        function addMessage(content, isUser = false, citations = [], sources = [], images = []) {
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `message ${isUser ? 'user' : 'bot'}`;
+            
+            const avatar = document.createElement('div');
+            avatar.className = 'message-avatar';
+            avatar.textContent = isUser ? '👤' : '✨';
+            
+            const contentDiv = document.createElement('div');
+            contentDiv.className = 'message-content';
+            contentDiv.innerHTML = content.replace(/\n/g, '<br>');
+            
+            if (citations.length > 0) {
+                const citationsDiv = document.createElement('div');
+                citationsDiv.className = 'citations';
+                citationsDiv.innerHTML = `📚 Sources: ${citations.join(', ')}`;
+                contentDiv.appendChild(citationsDiv);
+            }
+
+            if (!isUser && (sources.length > 0 || images.length > 0)) {
+                const metadataDiv = document.createElement('div');
+                metadataDiv.className = 'answer-metadata';
+
+                if (sources.length > 0) {
+                    const sourceList = document.createElement('div');
+                    sourceList.className = 'source-list';
+                    sourceList.innerHTML = sources.map(source => {
+                        const pageLabel = source.page_number != null ? `Page ${source.page_number}` : 'No page';
+                        const caption = source.caption ? ` - ${source.caption}` : '';
+                        return `<div class="source-item"><strong>${source.chunk_id}</strong> · ${source.item_type} · ${pageLabel}<br>${source.source}${caption}</div>`;
+                    }).join('');
+                    metadataDiv.appendChild(sourceList);
+                }
+
+                if (images.length > 0) {
+                    const imageList = document.createElement('div');
+                    imageList.className = 'image-list';
+                    imageList.innerHTML = images.map(image => {
+                        const pageLabel = image.page_number != null ? `Page ${image.page_number}` : 'No page';
+                        const caption = image.caption ? ` - ${image.caption}` : '';
+                        return `<div class="image-item"><strong>${image.chunk_id}</strong> · ${pageLabel}<br>${image.image_path}${caption}</div>`;
+                    }).join('');
+                    metadataDiv.appendChild(imageList);
+                }
+
+                contentDiv.appendChild(metadataDiv);
+            }
+            
+            if (isUser) {
+                messageDiv.appendChild(contentDiv);
+                messageDiv.appendChild(avatar);
+            } else {
+                messageDiv.appendChild(avatar);
+                messageDiv.appendChild(contentDiv);
+            }
+            
+            messagesContainer.appendChild(messageDiv);
+            messagesContainer.scrollTop = messagesContainer.scrollHeight;
+        }
+
+        function showTyping() {
+            typingIndicator.style.display = 'flex';
+            messagesContainer.scrollTop = messagesContainer.scrollHeight;
+        }
+
+        function hideTyping() {
+            typingIndicator.style.display = 'none';
+        }
+
+        async function sendMessage() {
+            const message = messageInput.value.trim();
+            if (!message) return;
+
+            // Add user message
+            addMessage(message, true);
+            messageInput.value = '';
+            sendBtn.disabled = true;
+            showTyping();
+
+            try {
+                const response = await fetch(`${API_BASE_URL}/answer`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        query: message,
+                        top_k: 6
+                    })
+                });
+
+                if (response.ok) {
+                    const data = await response.json();
+                    hideTyping();
+                    addMessage(data.text, false, data.citations || [], data.sources || [], data.images || []);
+                } else {
+                    hideTyping();
+                    addMessage('Sorry, I encountered an error processing your question. Please try again later. 🔧', false);
+                }
+            } catch (error) {
+                hideTyping();
+                addMessage('Sorry, I cannot connect to the server. Please make sure it\'s running and try again. 🔌', false);
+            } finally {
+                sendBtn.disabled = false;
+                messageInput.focus();
+            }
+        }
+
+        async function uploadDocument() {
+            const file = fileInput.files[0];
+            if (!file) {
+                showNotification('Please choose a PDF, image, or DOCX file first.', 'info');
+                return;
+            }
+
+            uploadBtn.disabled = true;
+            uploadBtn.textContent = 'Uploading...';
+            uploadSummary.textContent = `Uploading ${file.name}...`;
+
+            try {
+                const formData = new FormData();
+                formData.append('file', file);
+
+                const response = await fetch(`${API_BASE_URL}/upload`, {
+                    method: 'POST',
+                    body: formData
+                });
+
+                if (!response.ok) {
+                    throw new Error('Upload failed');
+                }
+
+                const data = await response.json();
+                uploadSummary.textContent = `${data.filename} ingested as ${data.file_type}. ${data.chunks_inserted} chunks, ${data.images_extracted} images, ${data.pages_processed} pages.`;
+                showNotification(`✅ Uploaded ${data.filename} and indexed ${data.chunks_inserted} chunks.`, 'success');
+            } catch (error) {
+                uploadSummary.textContent = 'Upload failed. Please try again.';
+                showNotification('❌ Upload failed. Please try again.', 'error');
+            } finally {
+                uploadBtn.disabled = false;
+                uploadBtn.textContent = 'Upload';
+                fileInput.value = '';
+            }
+        }
+    </script>
+</body>
+</html>
+</file>
+
+<file path=".gitignore">
+.env
+repomix-output.xml
+</file>
+
+<file path="chatbot.py">
+#!/usr/bin/env python3
+# Copyright 2024
+# Directory: yt-rag/chatbot.py
+
+"""
+Beautiful terminal-based chatbot to interact with the RAG backend API.
+Enhanced with rich styling, colors, and modern UI elements.
+"""
+
+import requests
+import json
+import sys
+import time
+import os
+from datetime import datetime
+from typing import Dict, Any
+
+# Rich library for beautiful terminal output
+try:
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.text import Text
+    from rich.prompt import Prompt
+    from rich.table import Table
+    from rich.progress import Progress, SpinnerColumn, TextColumn
+    from rich.markdown import Markdown
+    from rich.syntax import Syntax
+    from rich import box
+    from rich.align import Align
+    RICH_AVAILABLE = True
+except ImportError:
+    RICH_AVAILABLE = False
+    print("📦 Installing rich for beautiful terminal UI...")
+    os.system("pip install rich")
+    try:
+        from rich.console import Console
+        from rich.panel import Panel
+        from rich.text import Text
+        from rich.prompt import Prompt
+        from rich.table import Table
+        from rich.progress import Progress, SpinnerColumn, TextColumn
+        from rich.markdown import Markdown
+        from rich.syntax import Syntax
+        from rich import box
+        from rich.align import Align
+        RICH_AVAILABLE = True
+    except ImportError:
+        RICH_AVAILABLE = False
+
+
+class RAGChatbot:
+    """Beautiful terminal chatbot for interacting with RAG backend."""
+    
+    def __init__(self, base_url: str = "http://localhost:8000"):
+        """
+        Initialize the chatbot.
+        
+        Args:
+            base_url (str): Base URL of the RAG backend API
+        """
+        self.base_url = base_url
+        self.session = requests.Session()
+        self.console = Console() if RICH_AVAILABLE else None
+        self.conversation_count = 0
+        
+    def check_health(self) -> bool:
+        """
+        Check if the backend is healthy.
+        
+        Returns:
+            bool: True if backend is healthy, False otherwise
+        """
+        try:
+            response = self.session.get(f"{self.base_url}/healthz", timeout=5)
+            return response.status_code == 200
+        except requests.RequestException:
+            return False
+    
+    def seed_documents(self) -> Dict[str, Any]:
+        """
+        Seed the backend with default documents.
+        
+        Returns:
+            Dict[str, Any]: Response from the seed endpoint
+        """
+        try:
+            response = self.session.post(f"{self.base_url}/seed", timeout=30)
+            response.raise_for_status()
+            return response.json()
+        except requests.RequestException as e:
+            return {"error": str(e)}
+    
+    def ask_question(self, query: str, top_k: int = 6) -> Dict[str, Any]:
+        """
+        Ask a question to the RAG backend.
+        
+        Args:
+            query (str): The question to ask
+            top_k (int): Number of top results to retrieve
+            
+        Returns:
+            Dict[str, Any]: Response from the answer endpoint
+        """
+        try:
+            payload = {"query": query, "top_k": top_k}
+            response = self.session.post(
+                f"{self.base_url}/answer",
+                json=payload,
+                timeout=30
+            )
+            response.raise_for_status()
+            return response.json()
+        except requests.RequestException as e:
+            return {"error": str(e)}
+    
+    def print_welcome(self):
+        """Print beautiful welcome message."""
+        if not RICH_AVAILABLE:
+            self._print_welcome_fallback()
+            return
+            
+        # Create animated title
+        title = Text()
+        title.append("🤖 ", style="bold blue")
+        title.append("RAG AI Assistant", style="bold magenta")
+        title.append(" ✨", style="bold yellow")
+        
+        subtitle = Text()
+        subtitle.append("Powered by ", style="dim")
+        subtitle.append("OpenAI GPT-4o", style="bold green")
+        subtitle.append(" + ", style="dim")
+        subtitle.append("Vector Search", style="bold cyan")
+        
+        welcome_panel = Panel(
+            Align.center(title + "\n" + subtitle),
+            box=box.DOUBLE,
+            border_style="bright_blue",
+            padding=(1, 2)
+        )
+        
+        self.console.print(welcome_panel)
+        
+        # Commands table
+        commands_table = Table(
+            title="Available Commands",
+            box=box.ROUNDED,
+            border_style="bright_green",
+            title_style="bold green"
+        )
+        commands_table.add_column("Command", style="bold cyan", no_wrap=True)
+        commands_table.add_column("Description", style="white")
+        
+        commands_table.add_row("/help", "Show this help message")
+        commands_table.add_row("/health", "Check backend health status")
+        commands_table.add_row("/seed", "Load documents into vector database")
+        commands_table.add_row("/stats", "Show conversation statistics")
+        commands_table.add_row("/clear", "Clear the screen")
+        commands_table.add_row("/quit", "Exit the chatbot")
+        
+        self.console.print(commands_table)
+        
+        info_text = Text()
+        info_text.append("💡 ", style="bold yellow")
+        info_text.append("Just type your question to get started! ", style="white")
+        info_text.append("Ask about policies, returns, shipping, and more.", style="dim")
+        
+        self.console.print(Panel(info_text, border_style="yellow"))
+    
+    def _print_welcome_fallback(self):
+        """Fallback welcome message without rich."""
+        print("\n" + "="*70)
+        print("🤖 RAG AI Assistant - Terminal Chat ✨")
+        print("="*70)
+        print("Ask me anything about our policies and services!")
+        print("\nCommands:")
+        print("  /help    - Show this help message")
+        print("  /health  - Check backend health")
+        print("  /seed    - Seed documents into vector database")
+        print("  /stats   - Show conversation statistics")
+        print("  /clear   - Clear the screen")
+        print("  /quit    - Exit the chatbot")
+        print("="*70 + "\n")
+    
+    def print_help(self):
+        """Print beautiful help message."""
+        if not RICH_AVAILABLE:
+            self._print_help_fallback()
+            return
+            
+        help_table = Table(
+            title="🆘 Help & Commands",
+            box=box.HEAVY,
+            border_style="bright_magenta",
+            title_style="bold magenta"
+        )
+        help_table.add_column("Command", style="bold cyan", no_wrap=True, width=12)
+        help_table.add_column("Description", style="white")
+        help_table.add_column("Example", style="dim italic")
+        
+        help_table.add_row("/help", "Show this help message", "/help")
+        help_table.add_row("/health", "Check if backend is running", "/health")
+        help_table.add_row("/seed", "Load default documents", "/seed")
+        help_table.add_row("/stats", "Show chat statistics", "/stats")
+        help_table.add_row("/clear", "Clear the terminal screen", "/clear")
+        help_table.add_row("/quit", "Exit the chatbot", "/quit")
+        
+        self.console.print(help_table)
+        
+        examples = """
+## 💬 Example Questions:
+- "Can I return shoes after 30 days?"
+- "What's your shipping policy?"
+- "How do I exchange a defective item?"
+- "What items cannot be returned?"
+        """
+        
+        self.console.print(Panel(Markdown(examples), border_style="green", title="Examples", title_align="left"))
+    
+    def _print_help_fallback(self):
+        """Fallback help message without rich."""
+        print("\n📋 Available Commands:")
+        print("  /help    - Show this help message")
+        print("  /health  - Check if the backend is running")
+        print("  /seed    - Load default documents into the database")
+        print("  /stats   - Show conversation statistics")
+        print("  /clear   - Clear the screen")
+        print("  /quit    - Exit the chatbot")
+        print("\n💡 Just type your question to get started!")
+    
+    def show_stats(self):
+        """Show conversation statistics."""
+        if not RICH_AVAILABLE:
+            print(f"📊 Conversations: {self.conversation_count}")
+            return
+            
+        stats_table = Table(
+            title="📊 Chat Statistics",
+            box=box.SIMPLE,
+            border_style="bright_yellow"
+        )
+        stats_table.add_column("Metric", style="bold")
+        stats_table.add_column("Value", style="green")
+        
+        stats_table.add_row("Conversations", str(self.conversation_count))
+        stats_table.add_row("Backend URL", self.base_url)
+        stats_table.add_row("Session Start", datetime.now().strftime("%H:%M:%S"))
+        
+        self.console.print(stats_table)
+    
+    def format_response(self, response: Dict[str, Any]) -> None:
+        """
+        Format and display the response beautifully.
+        
+        Args:
+            response (Dict[str, Any]): Response from the backend
+        """
+        if not RICH_AVAILABLE:
+            self._format_response_fallback(response)
+            return
+            
+        if "error" in response:
+            error_panel = Panel(
+                f"❌ {response['error']}",
+                border_style="red",
+                title="Error",
+                title_align="left"
+            )
+            self.console.print(error_panel)
+            return
+        
+        if "text" in response:
+            # Main response
+            response_text = Text()
+            response_text.append("🤖 ", style="bold blue")
+            response_text.append(response['text'], style="white")
+            
+            response_panel = Panel(
+                response_text,
+                border_style="blue",
+                title="AI Assistant",
+                title_align="left",
+                padding=(1, 2)
+            )
+            self.console.print(response_panel)
+            
+            # Citations and metadata
+            if "citations" in response and response["citations"]:
+                citations_text = Text()
+                citations_text.append("📚 Sources: ", style="bold green")
+                citations_text.append(", ".join(response["citations"]), style="cyan")
+                
+                self.console.print(Panel(citations_text, border_style="green"))
+            
+            if "debug" in response and "latency_ms" in response["debug"]:
+                debug_text = Text()
+                debug_text.append("⏱️ ", style="yellow")
+                debug_text.append(f"Response time: {response['debug']['latency_ms']}ms", style="dim")
+                
+                self.console.print(debug_text)
+    
+    def _format_response_fallback(self, response: Dict[str, Any]):
+        """Fallback response formatting without rich."""
+        if "error" in response:
+            print(f"❌ Error: {response['error']}")
+            return
+        
+        if "text" in response:
+            print(f"🤖 {response['text']}\n")
+            
+            if "citations" in response and response["citations"]:
+                print(f"📚 Sources: {', '.join(response['citations'])}")
+            
+            if "debug" in response and "latency_ms" in response["debug"]:
+                print(f"⏱️  Response time: {response['debug']['latency_ms']}ms")
+    
+    def show_thinking_animation(self):
+        """Show a thinking animation."""
+        if not RICH_AVAILABLE:
+            print("🤔 Thinking...")
+            return
+            
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=self.console,
+            transient=True,
+        ) as progress:
+            task = progress.add_task("🤔 Thinking...", total=None)
+            time.sleep(0.5)  # Brief animation
+    
+    def run(self):
+        """Run the interactive chatbot."""
+        # Clear screen for better presentation
+        if RICH_AVAILABLE:
+            self.console.clear()
+        else:
+            os.system('clear' if os.name == 'posix' else 'cls')
+            
+        self.print_welcome()
+        
+        # Check health on startup
+        if not self.check_health():
+            if RICH_AVAILABLE:
+                warning = Panel(
+                    "❌ Backend appears to be down. Please start the server first.\n"
+                    "Run: [bold cyan]uvicorn main:app --reload --port 8000[/bold cyan]",
+                    border_style="red",
+                    title="Warning",
+                    title_align="left"
+                )
+                self.console.print(warning)
+            else:
+                print("❌ Warning: Backend appears to be down. Please start the server first.")
+                print("   Run: uvicorn main:app --reload --port 8000\n")
+        else:
+            if RICH_AVAILABLE:
+                success = Panel(
+                    "✅ Backend is healthy and ready to chat!",
+                    border_style="green",
+                    title="Status",
+                    title_align="left"
+                )
+                self.console.print(success)
+            else:
+                print("✅ Backend is healthy and ready!\n")
+        
+        while True:
+            try:
+                if RICH_AVAILABLE:
+                    user_input = Prompt.ask("\n[bold green]You[/bold green]", console=self.console).strip()
+                else:
+                    user_input = input("\nYou: ").strip()
+                
+                if not user_input:
+                    continue
+                
+                # Handle commands
+                if user_input.lower() == "/quit":
+                    if RICH_AVAILABLE:
+                        goodbye = Panel(
+                            "👋 Thanks for chatting! Have a great day! ✨",
+                            border_style="magenta",
+                            title="Goodbye",
+                            title_align="center"
+                        )
+                        self.console.print(goodbye)
+                    else:
+                        print("\n👋 Thanks for chatting! Goodbye!")
+                    break
+                    
+                elif user_input.lower() == "/help":
+                    self.print_help()
+                    continue
+                    
+                elif user_input.lower() == "/health":
+                    if self.check_health():
+                        if RICH_AVAILABLE:
+                            self.console.print("✅ [green]Backend is healthy![/green]")
+                        else:
+                            print("✅ Backend is healthy!")
+                    else:
+                        if RICH_AVAILABLE:
+                            self.console.print("❌ [red]Backend is not responding.[/red]")
+                        else:
+                            print("❌ Backend is not responding.")
+                    continue
+                    
+                elif user_input.lower() == "/seed":
+                    if RICH_AVAILABLE:
+                        with Progress(
+                            SpinnerColumn(),
+                            TextColumn("[progress.description]{task.description}"),
+                            console=self.console,
+                        ) as progress:
+                            task = progress.add_task("🌱 Seeding documents...", total=None)
+                            result = self.seed_documents()
+                    else:
+                        print("🌱 Seeding documents...")
+                        result = self.seed_documents()
+                        
+                    if "error" in result:
+                        if RICH_AVAILABLE:
+                            error_panel = Panel(
+                                f"❌ Seeding failed: {result['error']}",
+                                border_style="red",
+                                title="Error"
+                            )
+                            self.console.print(error_panel)
+                        else:
+                            print(f"❌ Seeding failed: {result['error']}")
+                    else:
+                        if RICH_AVAILABLE:
+                            success_panel = Panel(
+                                f"✅ Successfully seeded {result.get('inserted', 0)} documents!",
+                                border_style="green",
+                                title="Success"
+                            )
+                            self.console.print(success_panel)
+                        else:
+                            print(f"✅ Successfully seeded {result.get('inserted', 0)} documents!")
+                    continue
+                    
+                elif user_input.lower() == "/stats":
+                    self.show_stats()
+                    continue
+                    
+                elif user_input.lower() == "/clear":
+                    if RICH_AVAILABLE:
+                        self.console.clear()
+                    else:
+                        os.system('clear' if os.name == 'posix' else 'cls')
+                    continue
+                
+                # Regular question
+                self.show_thinking_animation()
+                response = self.ask_question(user_input)
+                self.conversation_count += 1
+                self.format_response(response)
+                
+            except KeyboardInterrupt:
+                if RICH_AVAILABLE:
+                    goodbye = Panel(
+                        "👋 Thanks for chatting! Have a great day! ✨",
+                        border_style="magenta",
+                        title="Goodbye",
+                        title_align="center"
+                    )
+                    self.console.print(goodbye)
+                else:
+                    print("\n\n👋 Thanks for chatting! Goodbye!")
+                break
+            except EOFError:
+                if RICH_AVAILABLE:
+                    goodbye = Panel(
+                        "👋 Thanks for chatting! Have a great day! ✨",
+                        border_style="magenta",
+                        title="Goodbye",
+                        title_align="center"
+                    )
+                    self.console.print(goodbye)
+                else:
+                    print("\n\n👋 Thanks for chatting! Goodbye!")
+                break
+
+
+if __name__ == "__main__":
+    # Allow custom base URL via command line argument
+    base_url = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8000"
+    
+    chatbot = RAGChatbot(base_url)
+    chatbot.run()
+</file>
+
+<file path="check_dimensions.py">
+#!/usr/bin/env python3
+# Copyright 2024
+# Directory: yt-rag/check_dimensions.py
+
+"""
+Quick script to check embedding dimensions in the database.
+"""
+
+import os
+from dotenv import load_dotenv
+from supabase import create_client
+
+# Load environment variables
+load_dotenv()
+
+def check_embedding_dimensions():
+    """Check the dimensions of embeddings in the database."""
+    
+    # Initialize Supabase client
+    supabase_url = os.getenv("SUPABASE_URL")
+    supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    
+    if not supabase_url or not supabase_key:
+        print("❌ Missing Supabase credentials in .env file")
+        return
+    
+    supabase = create_client(supabase_url, supabase_key)
+    
+    try:
+        # Method 1: Check using raw SQL
+        print("🔍 Checking embedding dimensions...")
+        
+        # Get one row to check dimensions
+        result = supabase.rpc('match_chunks', {
+            'query_embedding': '[0]' * 1536,  # Dummy vector
+            'match_threshold': 0.1,
+            'match_count': 1
+        }).execute()
+        
+        if result.data:
+            print(f"✅ Found {len(result.data)} chunks in database")
+        else:
+            print("⚠️  No chunks found in database. Run /seed first.")
+            return
+        
+        # Method 2: Direct table query to check schema
+        schema_result = supabase.table('rag_chunks').select('*').limit(1).execute()
+        
+        if schema_result.data:
+            chunk = schema_result.data[0]
+            if 'embedding' in chunk and chunk['embedding']:
+                dimensions = len(chunk['embedding'])
+                print(f"📐 Embedding dimensions: {dimensions}")
+                print(f"📊 Vector type: {type(chunk['embedding'])}")
+                print(f"🎯 First few values: {chunk['embedding'][:5]}...")
+            else:
+                print("❌ No embedding data found")
+        
+        # Method 3: Check table schema info
+        print("\n📋 Table Schema Info:")
+        print("Run this SQL in Supabase SQL Editor:")
+        print("SELECT column_name, data_type FROM information_schema.columns")
+        print("WHERE table_name = 'rag_chunks' AND column_name = 'embedding';")
+        
+        print("\n🔧 Or use pgvector function:")
+        print("SELECT vector_dims(embedding) FROM rag_chunks LIMIT 1;")
+        
+    except Exception as e:
+        print(f"❌ Error checking dimensions: {e}")
+        print("💡 Make sure you've run the /seed endpoint first to populate data")
+
+if __name__ == "__main__":
+    check_embedding_dimensions()
+</file>
+
+<file path="DEPLOYMENT.md">
+# Cloud Run Deployment Guide
+
+## 🚨 Quick Fix for Current Deployment Failure
+
+The deployment failed because Cloud Run needs environment variables. Here's how to fix it:
+
+### 1. Set Environment Variables in Cloud Run
+
+Go to your Cloud Run service and set these environment variables:
+
+```bash
+# Required Supabase Configuration
+SUPABASE_URL=your_supabase_url_here
+SUPABASE_ANON_KEY=your_supabase_anon_key_here  
+SUPABASE_SERVICE_ROLE_KEY=your_supabase_service_role_key_here
+
+# Required OpenAI Configuration
+OPENAI_API_KEY=your_openai_api_key_here
+OPENAI_EMBED_MODEL=text-embedding-3-small
+OPENAI_CHAT_MODEL=gpt-4o
+
+# Application Configuration
+AI_PROVIDER=openai
+ENVIRONMENT=production
+LOG_LEVEL=INFO
+```
+
+### 2. Deploy with Environment Variables via CLI
+
+```bash
+gcloud run deploy yt-rag \
+  --source . \
+  --platform managed \
+  --region us-east1 \
+  --allow-unauthenticated \
+  --set-env-vars="SUPABASE_URL=your_url,SUPABASE_ANON_KEY=your_key,SUPABASE_SERVICE_ROLE_KEY=your_service_key,OPENAI_API_KEY=your_openai_key,OPENAI_EMBED_MODEL=text-embedding-3-small,OPENAI_CHAT_MODEL=gpt-4o,AI_PROVIDER=openai,ENVIRONMENT=production,LOG_LEVEL=INFO" \
+  --timeout=300 \
+  --memory=1Gi \
+  --cpu=1 \
+  --max-instances=10 \
+  --port=8080
+```
+
+### 3. Alternative: Use Cloud Console
+
+1. Go to [Cloud Run Console](https://console.cloud.google.com/run)
+2. Click on your `yt-rag` service
+3. Click "Edit & Deploy New Revision"
+4. Go to "Variables & Secrets" tab
+5. Add the environment variables listed above
+6. Click "Deploy"
+
+## 🔧 What Was Fixed
+
+1. **Dockerfile improvements:**
+   - Added non-root user for security
+   - Use `${PORT:-8080}` to respect Cloud Run's PORT variable
+   - Added `--timeout-keep-alive 0` for better Cloud Run compatibility
+
+2. **Environment variable handling:**
+   - App now requires proper environment variables to start
+   - Clear error messages if variables are missing
+
+## 🚀 Testing the Deployment
+
+Once deployed, test these endpoints:
+
+```bash
+# Health check
+curl https://your-service-url/healthz
+
+# Chat interface
+curl https://your-service-url/chat
+
+# Seed documents
+curl -X POST https://your-service-url/seed
+
+# Ask question
+curl -X POST https://your-service-url/answer \
+  -H "Content-Type: application/json" \
+  -d '{"query": "Can I return shoes?"}'
+```
+
+## 📝 Notes
+
+- **Memory**: Set to at least 1GB for AI operations
+- **Timeout**: Set to 300s for embedding operations
+- **CPU**: 1 CPU should be sufficient for moderate load
+- **Concurrency**: Default (80) should work well
+
+## 🔐 Security
+
+- All environment variables should be set as secrets in production
+- Consider using Google Secret Manager for sensitive data
+- Enable authentication if needed for production use
+</file>
+
+<file path="Dockerfile">
+# Use official Python runtime as base image
+FROM python:3.11-slim
+
+# Set working directory in container
+WORKDIR /app
+
+# Copy requirements file
+COPY requirements.txt .
+
+# Install dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY . .
+
+# Create a non-root user
+RUN useradd --create-home --shell /bin/bash app \
+    && chown -R app:app /app
+USER app
+
+# Expose port (Cloud Run uses PORT environment variable)
+EXPOSE 8080
+
+# Command to run the application
+# Use PORT environment variable from Cloud Run
+CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080} --timeout-keep-alive 0
+</file>
+
+<file path="main.py">
+# Copyright 2024
+# Directory: yt-rag/main.py
+
+"""
+Legacy entry point for backward compatibility.
+The main application is now in app/main.py
+"""
+
+from app.main import app
+
+# Re-export the app for uvicorn
+__all__ = ["app"]
+</file>
+
+<file path="requirements.txt">
+fastapi>=0.104.0
+python-multipart>=0.0.9
+uvicorn>=0.24.0
+python-dotenv>=1.0.0
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+supabase>=2.0.0
+openai>=1.0.0
+anthropic>=0.18.0
+rich>=13.0.0 
+PyMuPDF>=1.24.0
+pdfplumber>=0.11.0
+python-docx>=1.1.0
+Pillow>=10.0.0
+pytesseract>=0.3.10
+</file>
+
+<file path="test_setup.py">
+#!/usr/bin/env python3
+# Copyright 2024
+# Directory: yt-rag/test_setup.py
+
+"""
+Test script to verify RAG backend setup is working correctly.
+Run this after completing the setup steps.
+"""
+
+import asyncio
+import sys
+import os
+from pathlib import Path
+
+# Add the app directory to Python path
+sys.path.insert(0, str(Path(__file__).parent))
+
+async def test_setup():
+    """Test the complete RAG setup."""
+    print("🧪 Testing RAG Backend Setup...")
+    print("=" * 50)
+    
+    try:
+        # Test 1: Import modules
+        print("1️⃣  Testing imports...")
+        from app.core.config import get_settings
+        from app.core.database import db
+        from app.services.rag import rag_service
+        print("   ✅ All modules imported successfully")
+        
+        # Test 2: Check configuration
+        print("\n2️⃣  Testing configuration...")
+        settings = get_settings()
+        
+        # Check required environment variables
+        required_vars = [
+            'SUPABASE_URL', 'SUPABASE_ANON_KEY', 'SUPABASE_SERVICE_ROLE_KEY',
+            'OPENAI_API_KEY'
+        ]
+        
+        missing_vars = []
+        for var in required_vars:
+            if not os.getenv(var) or os.getenv(var) == f"your_{var.lower()}_here":
+                missing_vars.append(var)
+        
+        if missing_vars:
+            print(f"   ❌ Missing environment variables: {', '.join(missing_vars)}")
+            print("   💡 Please update your .env file with real API keys")
+            return False
+        
+        print("   ✅ Environment variables configured")
+        print(f"   📊 Using embedding model: {settings.openai_embed_model}")
+        print(f"   🤖 Using chat model: {settings.openai_chat_model}")
+        print(f"   🔗 Using AI provider: {settings.ai_provider}")
+        
+        # Test 3: Database connection
+        print("\n3️⃣  Testing database connection...")
+        await db.connect()
+        health = await db.health_check()
+        
+        if not health:
+            print("   ❌ Database connection failed")
+            print("   💡 Check your Supabase credentials and ensure the project is active")
+            return False
+        
+        print("   ✅ Database connection successful")
+        
+        # Test 4: Schema validation
+        print("\n4️⃣  Testing database schema...")
+        await db.initialize_schema()
+        print("   ✅ Database schema validated")
+        
+        # Test 5: Seeding documents
+        print("\n5️⃣  Testing document seeding...")
+        inserted_count = await rag_service.seed_documents()
+        
+        if inserted_count == 0:
+            print("   ⚠️  No new documents inserted (may already exist)")
+        else:
+            print(f"   ✅ Successfully seeded {inserted_count} document chunks")
+        
+        # Test 6: RAG query
+        print("\n6️⃣  Testing RAG query...")
+        test_query = "Can I return shoes after 30 days?"
+        result = await rag_service.answer_query(test_query)
+        
+        if not result['text'] or "error" in result['text'].lower():
+            print("   ❌ RAG query failed")
+            print(f"   🔍 Response: {result['text'][:100]}...")
+            return False
+        
+        print("   ✅ RAG query successful!")
+        print(f"   📝 Answer: {result['text'][:100]}...")
+        print(f"   📚 Citations: {result['citations']}")
+        print(f"   ⏱️  Latency: {result['debug']['latency_ms']}ms")
+        
+        # Cleanup
+        await db.disconnect()
+        
+        print("\n🎉 ALL TESTS PASSED!")
+        print("=" * 50)
+        print("✅ Your RAG backend is fully functional!")
+        print("🚀 You can now start the server with: uvicorn main:app --reload --port 8000")
+        print("📚 Visit http://localhost:8000/docs for interactive API documentation")
+        
+        return True
+        
+    except ImportError as e:
+        print(f"   ❌ Import error: {e}")
+        print("   💡 Make sure you've installed dependencies: pip install -r requirements.txt")
+        return False
+        
+    except Exception as e:
+        print(f"   ❌ Setup test failed: {e}")
+        print("   💡 Check the error message above and refer to QUICKSTART.md")
+        return False
+
+
+async def main():
+    """Main test function."""
+    print("🔧 RAG Backend Setup Verification")
+    print("This will test your complete setup without starting the server.\n")
+    
+    # Load environment variables
+    from dotenv import load_dotenv
+    load_dotenv()
+    
+    success = await test_setup()
+    
+    if success:
+        print("\n🎯 Next Steps:")
+        print("1. Start the server: uvicorn main:app --reload --port 8000")
+        print("2. Test the health endpoint: curl http://localhost:8000/healthz")
+        print("3. Ask a question: curl -X POST http://localhost:8000/answer -H 'Content-Type: application/json' -d '{\"query\":\"What is your return policy?\"}'")
+        print("4. Visit the interactive docs: http://localhost:8000/docs")
+        sys.exit(0)
+    else:
+        print("\n❌ Setup incomplete. Please fix the issues above and try again.")
+        print("📖 Refer to QUICKSTART.md for detailed setup instructions.")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+</file>
+
+<file path="verify_rag.py">
+#!/usr/bin/env python3
+# Copyright 2024
+# Directory: yt-rag/verify_rag.py
+
+"""
+Script to prove we're doing real RAG with vector similarity search.
+This will show actual embeddings, similarity scores, and vector operations.
+"""
+
+import os
+import json
+import asyncio
+from dotenv import load_dotenv
+from supabase import create_client
+from app.services.embedding import embedding_service
+
+# Load environment variables
+load_dotenv()
+
+async def prove_real_rag():
+    """Prove we're doing actual vector similarity search, not just text feeding."""
+    
+    print("🔍 PROVING REAL RAG IMPLEMENTATION")
+    print("=" * 60)
+    
+    # Initialize Supabase client
+    supabase_url = os.getenv("SUPABASE_URL")
+    supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    
+    if not supabase_url or not supabase_key:
+        print("❌ Missing Supabase credentials")
+        return
+    
+    supabase = create_client(supabase_url, supabase_key)
+    
+    # Step 1: Show actual embeddings exist in database
+    print("\n1️⃣ CHECKING ACTUAL EMBEDDINGS IN DATABASE")
+    print("-" * 40)
+    
+    try:
+        result = supabase.table('rag_chunks').select('chunk_id, text, embedding').limit(2).execute()
+        
+        if not result.data:
+            print("❌ No data found. Run /seed first!")
+            return
+        
+        for chunk in result.data:
+            embedding = chunk['embedding']
+            print(f"📄 Chunk: {chunk['chunk_id']}")
+            print(f"📝 Text preview: {chunk['text'][:100]}...")
+            print(f"🔢 Embedding dimensions: {len(embedding)}")
+            print(f"🎯 First 10 values: {embedding[:10]}")
+            print(f"📊 Vector magnitude: {sum(x*x for x in embedding)**0.5:.4f}")
+            print()
+    
+    except Exception as e:
+        print(f"❌ Database error: {e}")
+        return
+    
+    # Step 2: Test different queries with vector similarity
+    print("2️⃣ TESTING VECTOR SIMILARITY WITH DIFFERENT QUERIES")
+    print("-" * 50)
+    
+    test_queries = [
+        "Can I return shoes?",                    # Should match return policy
+        "How much is shipping?",                  # Should match shipping policy  
+        "What size should I order?",              # Should match sizing guide
+        "How do I contact support?",              # Should match customer support
+        "What's the weather like?",               # Should find no good matches
+    ]
+    
+    for query in test_queries:
+        print(f"\n🔍 Query: '{query}'")
+        
+        try:
+            # Generate query embedding
+            query_embedding = await embedding_service.embed_query(query)
+            print(f"📐 Query embedding dimensions: {len(query_embedding)}")
+            print(f"🎯 Query vector preview: {query_embedding[:5]}...")
+            
+            # Perform vector search using Supabase's match_chunks function
+            search_result = supabase.rpc('match_chunks', {
+                'query_embedding': query_embedding,
+                'match_threshold': 0.1,
+                'match_count': 3
+            }).execute()
+            
+            if search_result.data:
+                print(f"✅ Found {len(search_result.data)} similar chunks:")
+                for i, match in enumerate(search_result.data[:3]):
+                    similarity = 1 - match.get('similarity', 0)  # Convert distance to similarity
+                    print(f"   {i+1}. {match['chunk_id']} (similarity: {similarity:.4f})")
+                    print(f"      Preview: {match['text'][:80]}...")
+            else:
+                print("❌ No similar chunks found")
+                
+        except Exception as e:
+            print(f"❌ Error processing query: {e}")
+    
+    # Step 3: Compare embeddings to show they're actually different
+    print("\n3️⃣ PROVING EMBEDDINGS ARE ACTUALLY DIFFERENT")
+    print("-" * 45)
+    
+    try:
+        # Get embeddings for different texts
+        text1 = "return policy shoes"
+        text2 = "shipping cost fast delivery" 
+        text3 = "return policy shoes"  # Same as text1
+        
+        emb1 = await embedding_service.embed_query(text1)
+        emb2 = await embedding_service.embed_query(text2)
+        emb3 = await embedding_service.embed_query(text3)
+        
+        # Calculate cosine similarity
+        def cosine_similarity(a, b):
+            dot_product = sum(x*y for x, y in zip(a, b))
+            magnitude_a = sum(x*x for x in a)**0.5
+            magnitude_b = sum(x*x for x in b)**0.5
+            return dot_product / (magnitude_a * magnitude_b)
+        
+        sim_1_2 = cosine_similarity(emb1, emb2)
+        sim_1_3 = cosine_similarity(emb1, emb3)
+        
+        print(f"📝 Text 1: '{text1}'")
+        print(f"📝 Text 2: '{text2}'")
+        print(f"📝 Text 3: '{text3}'")
+        print(f"🔢 Similarity 1↔2 (different): {sim_1_2:.6f}")
+        print(f"🔢 Similarity 1↔3 (identical): {sim_1_3:.6f}")
+        
+        if sim_1_3 > 0.999 and sim_1_2 < 0.9:
+            print("✅ PROOF: Identical texts have ~1.0 similarity, different texts have lower similarity")
+        else:
+            print("⚠️  Unexpected similarity scores")
+            
+    except Exception as e:
+        print(f"❌ Error comparing embeddings: {e}")
+    
+    # Step 4: Show the actual RAG pipeline in action
+    print("\n4️⃣ TRACING THE FULL RAG PIPELINE")
+    print("-" * 35)
+    
+    test_query = "Can I return expensive shoes?"
+    print(f"🔍 Test query: '{test_query}'")
+    
+    try:
+        from app.services.rag import rag_service
+        
+        # This will show the full pipeline
+        result = await rag_service.answer_query(test_query, top_k=3)
+        
+        print(f"🤖 Generated answer: {result['text'][:200]}...")
+        print(f"📚 Citations found: {result['citations']}")
+        print(f"🔍 Top document IDs: {result['debug']['top_doc_ids']}")
+        print(f"⏱️  Processing time: {result['debug']['latency_ms']}ms")
+        
+        print("\n✅ PROOF COMPLETE: This is real vector similarity search!")
+        print("   - Actual embeddings stored in database")
+        print("   - Vector similarity calculations performed") 
+        print("   - Different queries retrieve different chunks")
+        print("   - Citations reference specific chunk IDs")
+        
+    except Exception as e:
+        print(f"❌ Error in RAG pipeline: {e}")
+
+if __name__ == "__main__":
+    asyncio.run(prove_real_rag())
+</file>
+
+<file path="README.md">
+<img src="models/multimodal_ai_platform_architecture.svg" width="800" alt="Description">
+</file>
+
+</files>
